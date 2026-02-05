@@ -1,0 +1,14 @@
+[package]
+name = "cnocr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# freetype = "0.7.2"
+harfbuzz_rs = "2.0.1"
+# harfbuzz = "0.6.0"
+# freetype = "0.7.2"
+# freetype-rs = {version="0.38.0", default-features=true}
+# harfbuzz_rs = {version="2.0.1", default-features=false}
+image = "0.25.9"
+rusttype = "0.9.3"
