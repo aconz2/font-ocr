@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::Read;
-use image::{DynamicImage, Rgba, Rgb, Pixel};
+use image::{DynamicImage, Rgba, Rgb, Pixel, Luma};
 
 // so it looks like 0.42 kerning
 
@@ -67,101 +67,201 @@ const FONT_FILE: &str = "Courier New.ttf";
 //    println!("Text rendered to rendered_text.png");
 //}
 //
+
+fn test_image() {
+    use font_kit::canvas::{Canvas, RasterizationOptions, Format};
+    use font_kit::source::SystemSource;
+    use font_kit::hinting::HintingOptions;
+    use font_kit::loaders::freetype;
+    use pathfinder_geometry::transform2d::Transform2F;
+    use pathfinder_geometry::vector::Vector2F;
+
+    let size = 13.0;
+    //let format = Format::Rgb24;
+    let format = Format::A8;
+    let rasterization = RasterizationOptions::GrayscaleAa;
+    let transform = Transform2F::default();
+    //let transform = Transform2F::from_translation(Vector2F::new(0.1, 0.1));
+    let char = ">".chars().next().unwrap();
+    let hinting = HintingOptions::Full(size);
+
+    let font = freetype::Font::from_path("Courier New.otf", 0).unwrap();
+
+    let glyph_id = font.glyph_for_char(char).unwrap();
+
+    let raster_rect = font
+        .raster_bounds(
+            glyph_id,
+            size,
+            transform,
+            hinting,
+            rasterization,
+        )
+        .unwrap();
+
+    println!("origin{:?}", raster_rect.origin());
+    let mut canvas = Canvas::new(raster_rect.size(), format);
+    font.rasterize_glyph(
+        &mut canvas,
+        glyph_id,
+        size,
+        Transform2F::from_translation(-raster_rect.origin().to_f32()) * transform,
+        hinting,
+        rasterization,
+    )
+    .unwrap();
+
+    match canvas.format {
+        Format::Rgba32 => unimplemented!(),
+        Format::Rgb24 => {
+            let mut image = DynamicImage::new_rgba8(raster_rect.width() as u32, raster_rect.height() as u32).to_rgb8();
+            for px in image.pixels_mut() {
+                *px = Rgb([255, 255, 255]);
+            }
+            for y in 0..raster_rect.height() {
+                let mut line = String::new();
+                let (row_start, row_end) = (y as usize * canvas.stride, (y + 1) as usize * canvas.stride);
+                let row = &canvas.pixels[row_start..row_end];
+                for x in 0..raster_rect.width() {
+                    let i = x as usize * 3;
+                    let mut color = Rgb([row[i], row[i + 1], row[i + 2]]);
+                    color.invert();
+                    image.put_pixel(x.try_into().unwrap(), y.try_into().unwrap(), color);
+                }
+            }
+            image.save("font_kit.png").unwrap();
+        }
+        Format::A8 => {
+            //let mut image = DynamicImage::new_luma8(raster_rect.width() as u32, raster_rect.height() as u32).to_luma8();
+            let mut image = DynamicImage::new_rgba8(raster_rect.width() as u32, raster_rect.height() as u32).to_rgba8();
+            for px in image.pixels_mut() {
+                //*px = Luma([255]);
+                //*px = Rgba([255, 255, 255, 0]);
+            }
+            for y in 0..raster_rect.height() {
+                let mut line = String::new();
+                let (row_start, row_end) = (y as usize * canvas.stride, (y + 1) as usize * canvas.stride);
+                let row = &canvas.pixels[row_start..row_end];
+                for x in 0..raster_rect.width() {
+                    let c = 255 - row[x as usize];
+                    if c != 255 {
+                        let color = Rgba([c, c, c, 255]);
+                        image.put_pixel(x.try_into().unwrap(), y.try_into().unwrap(), color);
+                    }
+                }
+            }
+            image.save("font_kit.png").unwrap();
+        }
+    }
+
+}
+
 fn main() {
     test_image();
     println!("Hello, world!");
 }
 
-use rusttype;
-use rusttype::{Font, Scale};
-fn load_font() -> Font<'static> {
-    let mut buf = vec![];
-    let mut f = File::open(FONT_FILE).unwrap();
-    f.read_to_end(&mut buf).unwrap();
-    Font::try_from_vec(buf).unwrap()
-}
-
-fn test_image() {
-    let font = load_font();
-
-    let scale = Scale::uniform(15.0);
-
-    //let text = "> ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let text = ">MTcxODE";
-    let text = "> MTcxODExL04gMi9UIDI3NTY3OC9IIFsgNTIyIDIzMV0+Pg1lbmRvYmoNICAgICAgICAgICAgICAg";
-    let color = (0, 0, 0);
-
-    let v_metrics = font.v_metrics(scale);
-    println!("ascent={} descent={}", v_metrics.ascent, v_metrics.descent);
-
-    //let glyphs: Vec<_> = font
-    //    .layout(text, scale, rusttype::point(0.0, 0.0 + v_metrics.ascent))
-    //    .collect();
-    //{
-    //
-    //    use harfbuzz_rs::{Face, UnicodeBuffer, shape, Font};
-    //    let hb_face = Face::from_file(FONT_FILE, 0).unwrap();
-    //    let mut hb_font = Font::new(hb_face);
-    //    let buffer = UnicodeBuffer::new().add_str(text);
-    //    let glyphs = shape(&mut hb_font, buffer, &[]);
-    //
-    //    let positions = glyphs.get_glyph_positions();
-    //    let infos = glyphs.get_glyph_infos();
-    //    for (info, pos) in infos.iter().zip(positions.iter()) {
-    //        println!("{info:?} {pos:?}");
-    //    }
-    //}
-
-    let start = rusttype::point(0.0, 0.0 + v_metrics.ascent);
-    let glyphs: Vec<_> = font.glyphs_for(text.chars())
-        .scan((None, 0.0), |(last, x), g| {
-            let g = g.scaled(scale);
-            if let Some(last) = last {
-                *x += font.pair_kerning(scale, *last, g.id());
-            }
-            let w = g.h_metrics().advance_width;
-            //println!("w={w}");
-            let next = g.positioned(start + rusttype::vector(*x, 0.0));
-            *last = Some(next.id());
-            *x += w * 0.98;
-            Some(next)
-        })
-        .collect();
-
-    let glyphs_height = (v_metrics.ascent - v_metrics.descent).ceil() as u32;
-    let glyphs_width = {
-        let min_x = glyphs
-            .first()
-            .map(|g| g.pixel_bounding_box().unwrap().min.x)
-            .unwrap();
-        let max_x = glyphs
-            .last()
-            .map(|g| g.pixel_bounding_box().unwrap().max.x)
-            .unwrap();
-        (max_x - min_x) as u32
-    };
-    println!("glyphs_height={glyphs_height} glyphs_width={glyphs_width}");
-
-    let mut image = DynamicImage::new_rgba8(glyphs_width + 2, glyphs_height + 0).to_rgba8();
-    println!("image is {}x{}", image.width(), image.height());
-
-    for px in image.pixels_mut() {
-        *px = Rgba([0, 0, 0, 0]);
-    }
-
-    let x_scaler = 1.01;
-
-    for glyph in glyphs {
-        if let Some(bounding_box) = glyph.pixel_bounding_box() {
-            glyph.draw(|x, y, v| {
-                let x = x + bounding_box.min.x as u32;
-                let x = (x as f32 * x_scaler) as u32;
-                let y = y + bounding_box.min.y as u32;
-                image.get_pixel_mut(x, y).blend(&Rgba([color.0, color.1, color.2, (v * 255.0) as u8]));
-            });
-        }
-    }
-
-    image.save("image_example.png").unwrap();
-}
-
+//use rusttype;
+//use rusttype::{Font, Scale};
+//fn load_font() -> Font<'static> {
+//    let mut buf = vec![];
+//    let mut f = File::open(FONT_FILE).unwrap();
+//    f.read_to_end(&mut buf).unwrap();
+//    Font::try_from_vec(buf).unwrap()
+//}
+//
+//fn test_image() {
+//    let font = load_font();
+//
+//    //let scale = Scale::uniform(15.0); // in pixels
+//    let scale = Scale{x: 14.0, y: 14.0}; // in pixels
+//
+//    //let text = "> ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+//    let text = "> MTcxODExL04gMi9UIDI3NTY3OC9IIFsgNTIyIDIzMV0+Pg1lbmRvYmoNICAgICAgICAgICAgICAg";
+//    let color = (0, 0, 0);
+//
+//    let v_metrics = font.v_metrics(scale);
+//    println!("ascent={} descent={}", v_metrics.ascent, v_metrics.descent);
+//
+//    //let glyphs: Vec<_> = font
+//    //    .layout(text, scale, rusttype::point(0.0, 0.0 + v_metrics.ascent))
+//    //    .collect();
+//    //{
+//    //
+//    //    use harfbuzz_rs::{Face, UnicodeBuffer, shape, Font};
+//    //    let hb_face = Face::from_file(FONT_FILE, 0).unwrap();
+//    //    let mut hb_font = Font::new(hb_face);
+//    //    let buffer = UnicodeBuffer::new().add_str(text);
+//    //    let glyphs = shape(&mut hb_font, buffer, &[]);
+//    //
+//    //    let positions = glyphs.get_glyph_positions();
+//    //    let infos = glyphs.get_glyph_infos();
+//    //    for (info, pos) in infos.iter().zip(positions.iter()) {
+//    //        println!("{info:?} {pos:?}");
+//    //    }
+//    //}
+//
+//    let mut base_image = image::open("imgs-000.png")
+//        .unwrap()
+//        .crop_imm(0, 0, 816, 100)
+//        .into_rgba8();
+//
+//    // 46 for the >
+//    let start = rusttype::point(46.0, 48.25 - 10.0);
+//    let glyphs: Vec<_> = font.glyphs_for(text.chars())
+//        .scan((None, 0.0), |(last, x), g| {
+//            let g = g.scaled(scale);
+//            if let Some(last) = last {
+//                *x += font.pair_kerning(scale, *last, g.id());
+//            }
+//            let w = g.h_metrics().advance_width;
+//            //println!("w={w}");
+//            let next = g.positioned(start + rusttype::vector(*x, 0.0));
+//            *last = Some(next.id());
+//            *x += w * 0.95;
+//            Some(next)
+//        })
+//        .collect();
+//
+//    let glyphs_height = (v_metrics.ascent - v_metrics.descent).ceil() as u32;
+//    let glyphs_width = {
+//        let min_x = glyphs
+//            .first()
+//            .map(|g| g.pixel_bounding_box().unwrap().min.x)
+//            .unwrap();
+//        let max_x = glyphs
+//            .last()
+//            .map(|g| g.pixel_bounding_box().unwrap().max.x)
+//            .unwrap();
+//        (max_x - min_x) as u32
+//    };
+//    println!("glyphs_height={glyphs_height} glyphs_width={glyphs_width}");
+//
+//    //let mut image = DynamicImage::new_rgba8(glyphs_width + 2, glyphs_height + 0).to_rgba8();
+//    let mut image = DynamicImage::new_rgba8(816, 100).to_rgba8();
+//    println!("image is {}x{}", image.width(), image.height());
+//
+//    for px in image.pixels_mut() {
+//        *px = Rgba([0, 0, 0, 0]);
+//    }
+//
+//    let x_scaler = 1.00;
+//
+//    for glyph in glyphs {
+//        if let Some(bounding_box) = glyph.pixel_bounding_box() {
+//            glyph.draw(|x, y, v| {
+//                let x = x + bounding_box.min.x as u32;
+//                let x = (x as f32 * x_scaler) as u32;
+//                let y = y + bounding_box.min.y as u32;
+//                image.get_pixel_mut(x, y).blend(&Rgba([color.0, color.1, color.2, (v * 255.0) as u8]));
+//            });
+//        }
+//    }
+//
+//    image.save("image_example.png").unwrap();
+//
+//    image::imageops::overlay(&mut base_image, &image, 0, 0);
+//    //DynamicImage::ImageRgba8(base_image).into_luma8().save("overlay.png").unwrap();
+//    DynamicImage::ImageRgba8(base_image).crop_imm(40, 20, 20, 40).save("overlay.png").unwrap();
+//}
+//
