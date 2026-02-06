@@ -68,97 +68,109 @@ const FONT_FILE: &str = "Courier New.ttf";
 //}
 //
 
-fn test_image() {
-    use font_kit::canvas::{Canvas, RasterizationOptions, Format};
-    use font_kit::source::SystemSource;
-    use font_kit::hinting::HintingOptions;
-    use font_kit::loaders::freetype;
-    use pathfinder_geometry::transform2d::Transform2F;
-    use pathfinder_geometry::vector::Vector2F;
+use font_kit::canvas::{Canvas, RasterizationOptions, Format};
+use font_kit::hinting::HintingOptions;
+use font_kit::loaders::freetype;
+use pathfinder_geometry::transform2d::Transform2F;
+use pathfinder_geometry::vector::Vector2F;
+use pathfinder_geometry::rect::RectF;
 
+fn test_image() {
     let size = 13.0;
-    //let format = Format::Rgb24;
+    let em = size / 1.24;
+
     let format = Format::A8;
     let rasterization = RasterizationOptions::GrayscaleAa;
-    let transform = Transform2F::default();
-    //let transform = Transform2F::from_translation(Vector2F::new(0.1, 0.1));
-    let char = ">".chars().next().unwrap();
+    //let transform = Transform2F::default();
+    let transform = Transform2F::from_translation(Vector2F::new(0.0, 0.0));
     let hinting = HintingOptions::Full(size);
 
     let font = freetype::Font::from_path("Courier New.otf", 0).unwrap();
+    let metrics = font.metrics();
+    //let height = metrics.ascent - metrics.descent;
+    //println!("height {height} {:.2} {:.2}", height/metrics.units_per_em as f32, height/metrics.units_per_em as f32 * size);
 
-    let glyph_id = font.glyph_for_char(char).unwrap();
+    println!("metrics {:?}", font.metrics());
+    println!("mono? {}", font.is_monospace());
 
-    let raster_rect = font
-        .raster_bounds(
+    let text = "> M";
+
+    let mut glyph_pos = vec![];
+    glyph_pos.reserve(text.len());
+
+    let mut pos = Vector2F::splat(0.);
+
+    for char in text.chars() {
+        let glyph_id = font.glyph_for_char(char).unwrap();
+        let advance = font.advance(glyph_id).unwrap();
+        glyph_pos.push((glyph_id, pos));
+        pos += font.advance(glyph_id).unwrap() * size / 24. / 96.
+    }
+
+    println!("{:?}", glyph_pos);
+
+    let mut bounds = RectF::new(Vector2F::splat(0.), Vector2F::splat(0.));
+    for (glyph_id, pos) in &glyph_pos {
+        let raster_rect = font
+            .raster_bounds(
+                *glyph_id,
+                size,
+                transform.translate(*pos),
+                hinting,
+                rasterization,
+            )
+            .unwrap();
+        bounds = bounds.union_rect(raster_rect.to_f32());
+    }
+
+    println!("{:?}", bounds);
+
+    let mut canvas = Canvas::new(bounds.round().to_i32().size(), format);
+
+    for (glyph_id, pos) in glyph_pos {
+        font.rasterize_glyph(
+            &mut canvas,
             glyph_id,
             size,
-            transform,
+            Transform2F::from_translation(-bounds.origin()).translate(pos),
             hinting,
             rasterization,
         )
         .unwrap();
+    }
 
-    println!("origin{:?}", raster_rect.origin());
-    let mut canvas = Canvas::new(raster_rect.size(), format);
-    font.rasterize_glyph(
-        &mut canvas,
-        glyph_id,
-        size,
-        Transform2F::from_translation(-raster_rect.origin().to_f32()) * transform,
-        hinting,
-        rasterization,
-    )
-    .unwrap();
-
-    match canvas.format {
-        Format::Rgba32 => unimplemented!(),
-        Format::Rgb24 => {
-            let mut image = DynamicImage::new_rgba8(raster_rect.width() as u32, raster_rect.height() as u32).to_rgb8();
-            for px in image.pixels_mut() {
-                *px = Rgb([255, 255, 255]);
+    //font.rasterize_glyph(
+    //    &mut canvas,
+    //    glyph_id,
+    //    size,
+    //    Transform2F::from_translation(-raster_rect.origin().to_f32()).translate(Vector2F::splat(1.)),
+    //    hinting,
+    //    rasterization,
+    //)
+    //.unwrap();
+    //
+    let w = canvas.size.x() as usize;
+    let h = canvas.size.y() as usize;
+    println!("w={w} h={h}");
+    let mut image = DynamicImage::new_rgba8(w as u32, h as u32).to_rgba8();
+    for y in 0..h {
+        let (row_start, row_end) = (y * canvas.stride, (y + 1) * canvas.stride);
+        let row = &canvas.pixels[row_start..row_end];
+        for x in 0..w {
+            let c = 255 - row[x];
+            if c != 255 {
+                let color = Rgba([c, c, c, 255]);
+                image.put_pixel(x as u32, y as u32, color);
             }
-            for y in 0..raster_rect.height() {
-                let mut line = String::new();
-                let (row_start, row_end) = (y as usize * canvas.stride, (y + 1) as usize * canvas.stride);
-                let row = &canvas.pixels[row_start..row_end];
-                for x in 0..raster_rect.width() {
-                    let i = x as usize * 3;
-                    let mut color = Rgb([row[i], row[i + 1], row[i + 2]]);
-                    color.invert();
-                    image.put_pixel(x.try_into().unwrap(), y.try_into().unwrap(), color);
-                }
-            }
-            image.save("font_kit.png").unwrap();
-        }
-        Format::A8 => {
-            //let mut image = DynamicImage::new_luma8(raster_rect.width() as u32, raster_rect.height() as u32).to_luma8();
-            let mut image = DynamicImage::new_rgba8(raster_rect.width() as u32, raster_rect.height() as u32).to_rgba8();
-            for px in image.pixels_mut() {
-                //*px = Luma([255]);
-                //*px = Rgba([255, 255, 255, 0]);
-            }
-            for y in 0..raster_rect.height() {
-                let mut line = String::new();
-                let (row_start, row_end) = (y as usize * canvas.stride, (y + 1) as usize * canvas.stride);
-                let row = &canvas.pixels[row_start..row_end];
-                for x in 0..raster_rect.width() {
-                    let c = 255 - row[x as usize];
-                    if c != 255 {
-                        let color = Rgba([c, c, c, 255]);
-                        image.put_pixel(x.try_into().unwrap(), y.try_into().unwrap(), color);
-                    }
-                }
-            }
-            image.save("font_kit.png").unwrap();
         }
     }
+
+    image.save("font_kit.png").unwrap();
 
 }
 
 fn main() {
     test_image();
-    println!("Hello, world!");
 }
 
 //use rusttype;
@@ -265,3 +277,20 @@ fn main() {
 //    DynamicImage::ImageRgba8(base_image).crop_imm(40, 20, 20, 40).save("overlay.png").unwrap();
 //}
 //
+//
+        //Format::Rgb24 => {
+        //    let mut image = DynamicImage::new_rgba8(raster_rect.width() as u32, raster_rect.height() as u32).to_rgb8();
+        //    for px in image.pixels_mut() {
+        //        *px = Rgb([255, 255, 255]);
+        //    }
+        //    for y in 0..raster_rect.height() {
+        //        let (row_start, row_end) = (y as usize * canvas.stride, (y + 1) as usize * canvas.stride);
+        //        let row = &canvas.pixels[row_start..row_end];
+        //        for x in 0..raster_rect.width() {
+        //            let i = x as usize * 3;
+        //            let mut color = Rgb([row[i], row[i + 1], row[i + 2]]);
+        //            color.invert();
+        //            image.put_pixel(x.try_into().unwrap(), y.try_into().unwrap(), color);
+        //        }
+        //    }
+        //    image.save("font_kit.png").unwrap();
