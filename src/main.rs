@@ -77,37 +77,42 @@ use pathfinder_geometry::rect::RectF;
 
 fn test_image() {
     let size = 13.0;
-    let em = size / 1.24;
+    //let start_pos = Vector2F::new(45.0, 48.);
+    let kern_x = 1.125;
+    let line_height = 1.18;
+    //let start_pos = Vector2F::new(45.0, 48. + size * line_height);
+    //let start_pos = Vector2F::new(45.0, 63.);
+    let start_pos = Vector2F::new(0., 0.);
+    // line height is 15.0 points
 
     let format = Format::A8;
     let rasterization = RasterizationOptions::GrayscaleAa;
-    //let transform = Transform2F::default();
-    let transform = Transform2F::from_translation(Vector2F::new(0.0, 0.0));
+    let transform = Transform2F::default();
     let hinting = HintingOptions::Full(size);
 
     let font = freetype::Font::from_path("Courier New.otf", 0).unwrap();
     let metrics = font.metrics();
-    //let height = metrics.ascent - metrics.descent;
-    //println!("height {height} {:.2} {:.2}", height/metrics.units_per_em as f32, height/metrics.units_per_em as f32 * size);
+    let height = metrics.ascent - metrics.descent;
+    println!("height {height} {}", height as f32 / 24. / 96.);
 
     println!("metrics {:?}", font.metrics());
     println!("mono? {}", font.is_monospace());
 
-    let text = "> M";
+    //let text = "> MTcxODExL04";
+    let text = "> MTcxODExL04gMi9UIDI3NTY3OC9IIFsgNTIyIDIzMV0+Pg1lbmRvYmoNICAgICAgICAgICAgICAg";
+    //let text = "> DQo1";
 
     let mut glyph_pos = vec![];
     glyph_pos.reserve(text.len());
 
-    let mut pos = Vector2F::splat(0.);
+    let mut pos = start_pos;
 
     for char in text.chars() {
         let glyph_id = font.glyph_for_char(char).unwrap();
         let advance = font.advance(glyph_id).unwrap();
         glyph_pos.push((glyph_id, pos));
-        pos += font.advance(glyph_id).unwrap() * size / 24. / 96.
+        pos += font.advance(glyph_id).unwrap() * size / 24. / 96. * kern_x;
     }
-
-    println!("{:?}", glyph_pos);
 
     let mut bounds = RectF::new(Vector2F::splat(0.), Vector2F::splat(0.));
     for (glyph_id, pos) in &glyph_pos {
@@ -139,19 +144,10 @@ fn test_image() {
         .unwrap();
     }
 
-    //font.rasterize_glyph(
-    //    &mut canvas,
-    //    glyph_id,
-    //    size,
-    //    Transform2F::from_translation(-raster_rect.origin().to_f32()).translate(Vector2F::splat(1.)),
-    //    hinting,
-    //    rasterization,
-    //)
-    //.unwrap();
-    //
     let w = canvas.size.x() as usize;
     let h = canvas.size.y() as usize;
     println!("w={w} h={h}");
+
     let mut image = DynamicImage::new_rgba8(w as u32, h as u32).to_rgba8();
     for y in 0..h {
         let (row_start, row_end) = (y * canvas.stride, (y + 1) * canvas.stride);
@@ -164,8 +160,33 @@ fn test_image() {
             }
         }
     }
-
     image.save("font_kit.png").unwrap();
+
+    let mut image = DynamicImage::new_luma8(w as u32, h as u32).to_luma8();
+    for px in image.pixels_mut() {
+        *px = Luma([255]);
+    }
+    for y in 0..h {
+        let (row_start, row_end) = (y * canvas.stride, (y + 1) * canvas.stride);
+        let row = &canvas.pixels[row_start..row_end];
+        for x in 0..w {
+            let c = 255 - row[x];
+            if c != 255 {
+                let color = Luma([c]);
+                image.put_pixel(x as u32, y as u32, color);
+            }
+        }
+    }
+    image.save("font_kit-l8.png").unwrap();
+
+    let mut base_image = image::open("imgs-000.png")
+        .unwrap()
+        .crop_imm(45, 48 - 9, 608, 12)
+        //.crop_imm(0, 0, 200, 100)
+        .into_rgba8();
+
+    //image::imageops::overlay(&mut base_image, &image, 0, 0);
+    base_image.save("overlay.png").unwrap();
 
 }
 
