@@ -137,12 +137,10 @@ fn decode_line(reference: &GrayImage, font: &Font, nchars: usize, size: f32, ker
     println!("decode canvas size {:?}", canvas.size);
 
     let mut pos = start_pos;
-    println!("(pos {pos:?})");
 
     let char_gids: Vec<_> = alphabet.chars().map(|c| (c, font.glyph_for_char(c).unwrap())).collect();
-    println!("{char_gids:?}");
 
-    let mut score_glyph = |(_char, gid): &&(char, u32)| {
+    let mut score_glyph = |(_char, gid): &&(char, u32), pos: Vector2F| {
         canvas.pixels.fill(0);
 
         let raster_rect = font
@@ -185,7 +183,8 @@ fn decode_line(reference: &GrayImage, font: &Font, nchars: usize, size: f32, ker
 
     (0..nchars)
         .map(|_| {
-            let (c, _) = char_gids.iter().min_by_key(&mut score_glyph).unwrap();
+            let (c, gid) = char_gids.iter().min_by_key(|t| score_glyph(t, pos)).unwrap();
+            pos += font.advance(*gid).unwrap() * size / 24. / 96. * kern_x;
             c
         })
         .collect()
@@ -272,8 +271,11 @@ fn test_image() {
     let start_pos = Vector2F::new(0., 0.);
     let alphabet = "> =ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     //let alphabet = "> M";
-    let line = decode_line(&reference_image, &font, 10, size, kern_x, start_pos, alphabet);
+    let n_chars = 78;
+    let n_chars = 10;
+    let line = decode_line(&reference_image, &font, n_chars, size, kern_x, start_pos, alphabet);
     println!("yo decoded line to `{line}`");
+    println!("match? {}", line == text);
 
 }
 
