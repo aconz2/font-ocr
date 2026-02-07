@@ -134,7 +134,6 @@ fn decode_line(reference: &GrayImage, font: &Font, nchars: usize, size: f32, ker
 
     let (w, h) = reference.dimensions();
     let mut canvas = Canvas::new(Vector2I::new(w as i32, h as i32), format);
-    println!("decode canvas size {:?}", canvas.size);
 
     let mut pos = start_pos;
 
@@ -152,7 +151,8 @@ fn decode_line(reference: &GrayImage, font: &Font, nchars: usize, size: f32, ker
                 rasterization,
             )
             .unwrap();
-        //println!("raster rect {raster_rect:?}");
+
+        //println!("{_char} raster rect {:?} {:?}", raster_rect.origin(), raster_rect.size());
         font.rasterize_glyph(
             &mut canvas,
             *gid,
@@ -164,14 +164,15 @@ fn decode_line(reference: &GrayImage, font: &Font, nchars: usize, size: f32, ker
         )
         .unwrap();
 
-        let mut pixels = canvas.pixels.clone();
-        for px in pixels.iter_mut() {
-            *px = 255 - *px;
-        }
-        GrayImage::from_raw(w, h, pixels).unwrap().save("foo.png").unwrap();
+        //let mut pixels = canvas.pixels.clone();
+        //for px in pixels.iter_mut() {
+        //    *px = 255 - *px;
+        //}
+        //GrayImage::from_raw(w, h, pixels).unwrap().save("foo.png").unwrap();
 
         let sqr = |x| { x * x };
 
+        // TODO can you just look at the rastered part? not sure how to get it
         let diff: i64 = reference
             .as_raw()
             .iter()
@@ -272,10 +273,32 @@ fn test_image() {
     let alphabet = "> =ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     //let alphabet = "> M";
     let n_chars = 78;
-    let n_chars = 10;
+    let n_chars = 1;
     let line = decode_line(&reference_image, &font, n_chars, size, kern_x, start_pos, alphabet);
     println!("yo decoded line to `{line}`");
     println!("match? {}", line == text);
+
+    {
+        let reference_image = image::open("imgs-000.png").unwrap();
+        let x_start = 45;
+        let y_start = 48 - 9;
+        let width = 608;
+        let height = 12;
+        let n_chars = 78;
+        let n_lines = 65;
+
+        for i in 0..n_lines {
+            let img_line = reference_image.crop_imm(x_start, y_start + i * 15, width, height).into_luma8();
+            if img_line.height() == 0 {
+                break;
+            }
+            let line = decode_line(&img_line, &font, n_chars, size, kern_x, start_pos, alphabet);
+            if line.is_empty() {
+                break;
+            }
+            println!("{i} {line}");
+        }
+    }
 
 }
 
