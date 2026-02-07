@@ -2,80 +2,25 @@
 
 use std::fs::File;
 use std::io::Read;
+
 use image::{DynamicImage, Rgba, Rgb, Pixel, Luma, GrayImage};
-
-// so it looks like 0.42 kerning
-
-//const FONT_FILE: &str = "/usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf";
-const FONT_FILE: &str = "Courier New.ttf";
-//const FONT_FILE: &str = "Courier.ttf";
-
-//fn test_image() {
-//    let text = "Rust Typography!";
-//    let font_size = 48;
-//
-//    // 1. Initialize FreeType and load the face
-//    let lib = Library::init().unwrap();
-//    let ft_face = lib.new_face(FONT_FILE, 0).unwrap();
-//    ft_face.set_char_size(font_size << 6, 0, 96, 96).unwrap();
-//
-//    // 2. Initialize HarfBuzz shaping
-//    let hb_face = Face::from_file(FONT_FILE, 0).unwrap();
-//    let mut hb_font = Font::new(hb_face);
-//    let buffer = UnicodeBuffer::new().add_str(text);
-//    let glyphs = shape(&mut hb_font, buffer, &[]);
-//
-//    let positions = glyphs.get_glyph_positions();
-//    let infos = glyphs.get_glyph_infos();
-//
-//    // 3. Prepare the Image canvas
-//    let mut img = GrayImage::new(800, 200);
-//    let mut cursor_x = 20.0;
-//    let cursor_y = 100.0;
-//
-//    // 4. Render each glyph
-//    for (info, pos) in infos.iter().zip(positions.iter()) {
-//        let gid = info.codepoint;
-//        ft_face.load_glyph(gid, freetype::face::LoadFlag::RENDER).unwrap();
-//
-//        let glyph = ft_face.glyph();
-//        let bitmap = glyph.bitmap();
-//        let x = cursor_x + (glyph.bitmap_left() as f32) + (pos.x_offset as f32 / 64.0);
-//        let y = cursor_y - (glyph.bitmap_top() as f32) - (pos.y_offset as f32 / 64.0);
-//
-//        // Draw the bitmap pixels onto our GrayImage
-//        let width = bitmap.width() as u32;
-//        let rows = bitmap.rows() as u32;
-//        let buffer = bitmap.buffer();
-//
-//        for row in 0..rows {
-//            for col in 0..width {
-//                let pixel_val = buffer[(row * width + col) as usize];
-//                if pixel_val > 0 {
-//                    let px = (x as u32 + col) as u32;
-//                    let py = (y as u32 + row) as u32;
-//                    if px < img.width() && py < img.height() {
-//                        img.put_pixel(px, py, Luma([pixel_val]));
-//                    }
-//                }
-//            }
-//        }
-//
-//        // Advance the cursor
-//        cursor_x += pos.x_advance as f32 / 64.0;
-//    }
-//
-//    img.save("rendered_text.png").unwrap();
-//    println!("Text rendered to rendered_text.png");
-//}
-//
-
 use font_kit::canvas::{Canvas, RasterizationOptions, Format};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F,Vector2I};
 use pathfinder_geometry::rect::{RectI,RectF};
+
+//const FONT_FILE: &str = "/usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf";
+const FONT_FILE: &str = "Courier New.ttf";
+//const FONT_FILE: &str = "Courier.ttf";
+
+struct RenderOptions {
+    rasterization: RasterizationOptions,
+    hinting: HintingOptions,
+    format: Format,
+    size: f32,
+}
 
 fn render(font: &Font, text: &str, size: f32, kern_x: f32, start_pos: Vector2F) -> Canvas {
     let format = Format::A8;
@@ -126,65 +71,76 @@ fn render(font: &Font, text: &str, size: f32, kern_x: f32, start_pos: Vector2F) 
     canvas
 }
 
+fn sum_of_squares(xs: &[u8], ys: &[u8]) -> i64 {
+    assert!(xs.len() == ys.len());
+    xs.iter().zip(ys).map(|(x, y)| (*x as i32 - *y as i32).pow(2) as i64).sum::<i64>()
+}
+
+fn score_glyph(mut canvas: &mut Canvas, font: &Font, reference_pixels: &Vec<u8>, _char: char, gid: u32, origin: Vector2F, pos: Vector2F, render_options: &RenderOptions) -> i64 {
+    canvas.pixels.fill(0);
+
+    let raster_rect = font
+        .raster_bounds(
+            gid,
+            render_options.size,
+            Transform2F::from_translation(pos),
+            render_options.hinting,
+            render_options.rasterization,
+        )
+        .unwrap();
+
+    //println!("{_char} raster rect {:?} {:?}", raster_rect.origin(), raster_rect.size());
+    font.rasterize_glyph(
+        &mut canvas,
+        gid,
+        render_options.size,
+        // have to use the origin from as if we had a whole line, not just a single char...
+        Transform2F::from_translation(origin).translate(pos),
+        render_options.hinting,
+        render_options.rasterization,
+    )
+    .unwrap();
+
+    //let mut pixels = canvas.pixels.clone();
+    //for px in pixels.iter_mut() {
+    //    *px = 255 - *px;
+    //}
+    //GrayImage::from_raw(w, h, pixels).unwrap().save("foo.png").unwrap();
+
+    // TODO can you just look at the rastered part? not sure how to get it
+    sum_of_squares(reference_pixels, &canvas.pixels)
+}
+
 fn decode_line(reference: &GrayImage, font: &Font, nchars: usize, size: f32, kern_x: f32, start_pos: Vector2F, alphabet: &str) -> String {
-    let format = Format::A8;
-    let rasterization = RasterizationOptions::GrayscaleAa;
-    let transform = Transform2F::default();
-    let hinting = HintingOptions::Full(size);
+    let render_options = RenderOptions {
+        size: size,
+        format: Format::A8,
+        rasterization: RasterizationOptions::GrayscaleAa,
+        hinting: HintingOptions::Full(size),
+    };
+    let origin = Vector2F::new(0., 9.); // TODO
 
     let (w, h) = reference.dimensions();
-    let mut canvas = Canvas::new(Vector2I::new(w as i32, h as i32), format);
+    let mut canvas = Canvas::new(Vector2I::new(w as i32, h as i32), render_options.format);
 
     let mut pos = start_pos;
 
     let char_gids: Vec<_> = alphabet.chars().map(|c| (c, font.glyph_for_char(c).unwrap())).collect();
 
-    let mut score_glyph = |(_char, gid): &&(char, u32), pos: Vector2F| {
-        canvas.pixels.fill(0);
+    // invert the reference since raster prints white text on black bg
+    let reference_pixels: Vec<_> = reference.as_raw().iter().map(|x| 255 - x).collect();
 
-        let raster_rect = font
-            .raster_bounds(
-                *gid,
-                size,
-                Transform2F::from_translation(pos),
-                hinting,
-                rasterization,
-            )
-            .unwrap();
-
-        //println!("{_char} raster rect {:?} {:?}", raster_rect.origin(), raster_rect.size());
-        font.rasterize_glyph(
-            &mut canvas,
-            *gid,
-            size,
-            // have to use the origin from as if we had a whole line, not just a single char...
-            Transform2F::from_translation(Vector2F::new(0., 9.)).translate(pos),
-            hinting,
-            rasterization,
-        )
-        .unwrap();
-
-        //let mut pixels = canvas.pixels.clone();
-        //for px in pixels.iter_mut() {
-        //    *px = 255 - *px;
-        //}
-        //GrayImage::from_raw(w, h, pixels).unwrap().save("foo.png").unwrap();
-
-        let sqr = |x| { x * x };
-
-        // TODO can you just look at the rastered part? not sure how to get it
-        let diff: i64 = reference
-            .as_raw()
-            .iter()
-            .zip(canvas.pixels.iter())
-            .map(|(reference, canvas)| sqr(*reference as i32 - ((255 - canvas) as i32)) as i64)
-            .sum();
-        diff
-    };
+    // the diff score we calculate is very high because the canvas is always mostly empty; can
+    // subtract this baseline_diff to get a bit of a more sensible score, and the correct
+    // character will have a negative score, but it ultimately doesn't matter
+    // let baseline_diff = reference_pixels.iter().map(|v| (*v as i32).pow(2) as i64).sum::<i64>();
 
     (0..nchars)
         .map(|_| {
-            let (c, gid) = char_gids.iter().min_by_key(|t| score_glyph(t, pos)).unwrap();
+            let (c, gid) = char_gids
+                .iter()
+                .min_by_key(|(_char, gid)| score_glyph(&mut canvas, font, &reference_pixels, *_char, *gid, origin, pos, &render_options))
+                .unwrap();
             pos += font.advance(*gid).unwrap() * size / 24. / 96. * kern_x;
             c
         })
@@ -273,12 +229,12 @@ fn test_image() {
     let alphabet = "> =ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     //let alphabet = "> M";
     let n_chars = 78;
-    let n_chars = 1;
+    //let n_chars = 1;
     let line = decode_line(&reference_image, &font, n_chars, size, kern_x, start_pos, alphabet);
     println!("yo decoded line to `{line}`");
     println!("match? {}", line == text);
 
-    {
+    if false {
         let reference_image = image::open("imgs-000.png").unwrap();
         let x_start = 45;
         let y_start = 48 - 9;
@@ -296,7 +252,7 @@ fn test_image() {
             if line.is_empty() {
                 break;
             }
-            println!("{i} {line}");
+            println!("{line}");
         }
     }
 
