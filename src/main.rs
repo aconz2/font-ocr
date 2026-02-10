@@ -1,10 +1,15 @@
+use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{DynamicImage, GrayImage, Rgba};
+use image::{DynamicImage, GrayImage, Rgba, RgbaImage};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
+use rayon::prelude::*;
+
+const DEFAULT_ALPHABET: &str =
+    "> =ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 #[derive(Clone, Copy)]
 struct RenderOptions {
@@ -15,10 +20,22 @@ struct RenderOptions {
     kern_x: f32, // scaler of regular advance
 }
 
-fn render(font: &Font, text: &str, start_pos: Vector2F, render_options: RenderOptions) -> Canvas {
+#[derive(Clone, Copy)]
+struct DecodeOptions {
+    x_start: u32,
+    y_start: u32,
+    line_height: u32,
+    line_advance: u32,
+    width: u32,
+}
+
+#[allow(unused)]
+fn render(font: &Font, text: &str, render_options: RenderOptions) -> Canvas {
+    assert!(render_options.format == Format::A8);
+
     let mut glyph_pos = Vec::with_capacity(text.len());
 
-    let mut pos = start_pos;
+    let mut pos = Vector2F::default();
 
     for char in text.chars() {
         let glyph_id = font.glyph_for_char(char).unwrap();
@@ -27,21 +44,20 @@ fn render(font: &Font, text: &str, start_pos: Vector2F, render_options: RenderOp
             * render_options.kern_x;
     }
 
-    let mut bounds = RectF::new(Vector2F::splat(0.), Vector2F::splat(0.));
-    for (glyph_id, pos) in &glyph_pos {
-        let raster_rect = font
-            .raster_bounds(
-                *glyph_id,
-                render_options.size,
-                Transform2F::from_translation(*pos),
-                render_options.hinting,
-                render_options.rasterization,
-            )
-            .unwrap();
-        bounds = bounds.union_rect(raster_rect.to_f32());
-    }
-
-    println!("bounds={:?}", bounds);
+    let bounds = glyph_pos
+        .iter()
+        .fold(RectF::default(), |bounds, (glyph_id, pos)| {
+            let raster_rect = font
+                .raster_bounds(
+                    *glyph_id,
+                    render_options.size,
+                    Transform2F::from_translation(*pos),
+                    render_options.hinting,
+                    render_options.rasterization,
+                )
+                .unwrap();
+            bounds.union_rect(raster_rect.to_f32())
+        });
 
     let mut canvas = Canvas::new(bounds.round().to_i32().size(), render_options.format);
 
@@ -88,23 +104,15 @@ fn score_glyph(
         )
         .unwrap();
 
-    //println!("{_char} raster rect {:?} {:?}", raster_rect.origin(), raster_rect.size());
     font.rasterize_glyph(
         canvas,
         gid,
         render_options.size,
-        // have to use the origin from as if we had a whole line, not just a single char...
         Transform2F::from_translation(origin).translate(pos),
         render_options.hinting,
         render_options.rasterization,
     )
     .unwrap();
-
-    //let mut pixels = canvas.pixels.clone();
-    //for px in pixels.iter_mut() {
-    //    *px = 255 - *px;
-    //}
-    //GrayImage::from_raw(w, h, pixels).unwrap().save("foo.png").unwrap();
 
     // TODO can you just look at the rastered part? not sure how to get it
     sum_of_squares(reference_pixels, &canvas.pixels)
@@ -113,22 +121,37 @@ fn score_glyph(
 fn decode_line(
     reference: &GrayImage,
     font: &Font,
-    nchars: usize,
-    start_pos: Vector2F,
     alphabet: &str,
     render_options: RenderOptions,
 ) -> String {
-    let origin = Vector2F::new(0., 9.); // TODO
-
     let (w, h) = reference.dimensions();
     let mut canvas = Canvas::new(Vector2I::new(w as i32, h as i32), render_options.format);
 
-    let mut pos = start_pos;
+    let mut pos = Vector2F::default();
 
     let char_gids: Vec<_> = alphabet
         .chars()
         .map(|c| (c, font.glyph_for_char(c).unwrap()))
         .collect();
+
+    // compute the biggest bbox we need for all chars in the alphabet. The
+    // font.metrics().bounding_box seems to be too big? not sure if this is totally right
+    // in general, but works for initial testing
+    let bbox = char_gids
+        .iter()
+        .fold(RectF::default(), |bounds, (_char, gid)| {
+            let raster_rect = font
+                .raster_bounds(
+                    *gid,
+                    render_options.size,
+                    Transform2F::default(),
+                    render_options.hinting,
+                    render_options.rasterization,
+                )
+                .unwrap();
+            bounds.union_rect(raster_rect.to_f32())
+        });
+    let origin = -bbox.origin();
 
     // invert the reference since raster prints white text on black bg
     let reference_pixels: Vec<_> = reference.as_raw().iter().map(|x| 255 - x).collect();
@@ -138,65 +161,88 @@ fn decode_line(
     // character will have a negative score, but it ultimately doesn't matter
     // let baseline_diff = reference_pixels.iter().map(|v| (*v as i32).pow(2) as i64).sum::<i64>();
 
-    (0..nchars)
-        .map(|_| {
-            let (c, gid) = char_gids
-                .iter()
-                .min_by_key(|(_char, gid)| {
-                    score_glyph(
-                        &mut canvas,
-                        font,
-                        &reference_pixels,
-                        (*_char, *gid),
-                        origin,
-                        pos,
-                        render_options,
-                    )
-                })
-                .unwrap();
-            pos += font.advance(*gid).unwrap() * render_options.size / 24. / 96.
-                * render_options.kern_x;
-            c
-        })
-        .collect()
+    let mut s = String::new();
+    while pos.x() < w as f32 {
+        let (c, gid) = char_gids
+            .iter()
+            .min_by_key(|(_char, gid)| {
+                score_glyph(
+                    &mut canvas,
+                    font,
+                    &reference_pixels,
+                    (*_char, *gid),
+                    origin,
+                    pos,
+                    render_options,
+                )
+            })
+            .unwrap();
+
+        s.push(*c);
+
+        pos +=
+            font.advance(*gid).unwrap() * render_options.size / 24. / 96. * render_options.kern_x;
+    }
+    s
 }
 
-fn test_image() {
-    let size = 13.0;
-    let kern_x = 1.125;
-    let _line_height = 15.; // amount to skip down to write next line
-    //let start_pos = Vector2F::new(45.0, 48. + 15.); // < this matches the start pos of the whole page
-    let start_pos = Vector2F::new(0., 0.);
+fn decode_image(
+    ref_img: &DynamicImage,
+    font: &Font,
+    alphabet: &str,
+    decode_options: DecodeOptions,
+    render_options: RenderOptions,
+    mut cb: impl FnMut(String)
+) {
+    let DecodeOptions {
+        x_start,
+        y_start,
+        line_advance,
+        width,
+        line_height,
+    } = decode_options;
 
-    let render_options = RenderOptions {
-        format: Format::A8,
-        rasterization: RasterizationOptions::GrayscaleAa,
-        hinting: HintingOptions::Full(size),
-        size,
-        kern_x,
-    };
+    for i in 0..u32::MAX {
+        let img_line = ref_img
+            .crop_imm(x_start, y_start + i * line_advance, width, line_height)
+            .into_luma8();
 
-    let font = Font::from_path("Courier New.otf", 0).unwrap();
-    let metrics = font.metrics();
-    let height = metrics.ascent - metrics.descent;
-    println!("height {height} {}", height / 24. / 96.);
+        if img_line.height() == 0 {
+            break;
+        }
+        if img_line.as_raw().iter().all(|c| *c == 255) {
+            //eprintln!("whitespace line");
+            continue;
+        }
+        let line = decode_line(&img_line, &font, alphabet, render_options);
+        if line.is_empty() {
+            break;
+        }
+        cb(line);
+    }
+}
+fn decode_image_vec(
+    ref_img: &DynamicImage,
+    font: &Font,
+    alphabet: &str,
+    decode_options: DecodeOptions,
+    render_options: RenderOptions,
+) -> Vec<String> {
+    let mut ret = Vec::with_capacity(128);
+    decode_image(ref_img, font, alphabet, decode_options, render_options, |line| {
+        ret.push(line);
+    });
+    ret
+}
 
-    println!("metrics {:?}", font.metrics());
-    println!("mono? {}", font.is_monospace());
-
-    let text = "> MTcxODExL04gMi9UIDI3NTY3OC9IIFsgNTIyIDIzMV0+Pg1lbmRvYmoNICAgICAgICAgICAgICAg";
-    //let text = "> DQo1MTcxODExL04gMi9UIDI3NTY3OC9IIFsgNTIyIDIzMV0-----------------------------";
-    //let text = ">";
-
-    let canvas = render(&font, text, start_pos, render_options);
+#[allow(unused)]
+fn canvas_to_rgba8(canvas: &Canvas) -> RgbaImage {
     let w = canvas.size.x() as usize;
     let h = canvas.size.y() as usize;
-    println!("render canvas size w={w} h={h}");
 
     let mut image = DynamicImage::new_rgba8(w as u32, h as u32).to_rgba8();
     for y in 0..h {
-        let (row_start, row_end) = (y * canvas.stride, (y + 1) * canvas.stride);
-        let row = &canvas.pixels[row_start..row_end];
+        let row = &canvas.pixels[y * canvas.stride..(y + 1) * canvas.stride];
         for x in 0..w {
             let c = 255 - row[x];
             if c != 255 {
@@ -205,83 +251,146 @@ fn test_image() {
             }
         }
     }
-    image.save("font_kit.png").unwrap();
+    image
+}
 
+#[allow(unused)]
+fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
+    let w = canvas.size.x() as u32;
+    let h = canvas.size.y() as u32;
     let mut pixels = canvas.pixels.clone();
     for px in pixels.iter_mut() {
         *px = 255 - *px;
     }
-    GrayImage::from_raw(w as u32, h as u32, pixels)
-        .unwrap()
-        .save("font_kit-l8.png")
-        .unwrap();
+    GrayImage::from_raw(w as u32, h as u32, pixels).unwrap()
+}
 
-    let mut _base_image = image::open("imgs-000.png")
-        .unwrap()
-        //.crop_imm(45, 48 - 9, 608, 12)
-        .crop_imm(45, 48 - 9 + 0, 608, 12)
-        .into_rgba8();
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, num_args=1..)]
+    img: Vec<String>,
 
-    //image::imageops::overlay(&mut base_image, &image, 0, 0);
-    _base_image.save("overlay.png").unwrap();
+    #[arg(short, long)]
+    font: String,
 
-    let x_start = 45;
-    let y_start = 48 - 9;
-    let width = 608;
-    let height = 12;
-    let reference_image = image::open("imgs-000.png")
-        .unwrap()
-        .crop_imm(x_start, y_start, width, height)
-        .into_luma8();
+    #[arg(short, long, default_value_t=DEFAULT_ALPHABET.to_string())]
+    alphabet: String,
 
-    let start_pos = Vector2F::new(0., 0.);
-    let alphabet = "> =ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    //let alphabet = "> M";
-    let n_chars = 78;
-    //let n_chars = 1;
-    let line = decode_line(
-        &reference_image,
-        &font,
-        n_chars,
-        start_pos,
-        alphabet,
-        render_options,
-    );
-    println!("yo decoded line to `{line}`");
-    println!("match? {}", line == text);
+    #[arg(long)]
+    hinting: bool,
 
-    if false {
-        let reference_image = image::open("imgs-000.png").unwrap();
-        let x_start = 45;
-        let y_start = 48 - 9;
-        let width = 608;
-        let height = 12;
-        let n_chars = 78;
-        let n_lines = 65;
+    #[arg(short, long)]
+    text_size: f32,
 
-        for i in 0..n_lines {
-            let img_line = reference_image
-                .crop_imm(x_start, y_start + i * 15, width, height)
-                .into_luma8();
-            if img_line.height() == 0 {
-                break;
-            }
-            let line = decode_line(
-                &img_line,
-                &font,
-                n_chars,
-                start_pos,
-                alphabet,
-                render_options,
-            );
-            if line.is_empty() {
-                break;
-            }
-            println!("{line}");
-        }
-    }
+    #[arg(short, long, default_value_t = 1.0)]
+    kerning: f32,
+
+    #[arg(short, long, default_value_t = 0)]
+    x: u32,
+
+    #[arg(short, long, default_value_t = 0)]
+    y: u32,
+
+    #[arg(short, long)]
+    width: u32,
+
+    #[arg(long)]
+    line_height: u32,
+
+    #[arg(long)]
+    line_advance: u32,
+
+    #[arg(long)]
+    debug: bool,
 }
 
 fn main() {
-    test_image();
+    let args = Args::parse();
+
+    let hinting = if args.hinting {
+        HintingOptions::Full(args.text_size)
+    } else {
+        HintingOptions::None
+    };
+
+    let render_options = RenderOptions {
+        format: Format::A8,
+        rasterization: RasterizationOptions::GrayscaleAa,
+        size: args.text_size,
+        kern_x: args.kerning,
+        hinting,
+    };
+
+    let decode_options = DecodeOptions {
+        x_start: args.x,
+        y_start: args.y,
+        width: args.width,
+        line_height: args.line_height,
+        line_advance: args.line_advance,
+    };
+
+    if args.img.len() == 1 {
+        let font = Font::from_path(args.font.clone(), 0).unwrap();
+        let img = image::open(args.img.first().unwrap()).unwrap();
+
+        decode_image(&img, &font, &args.alphabet, decode_options, render_options, |line| {
+            println!("{line}");
+        });
+    } else {
+        let imgs: Vec<_> = args.img.into_iter().enumerate().collect();
+        let mut liness: Vec<_> = imgs.into_par_iter().map(|(i, img)| {
+            let font = Font::from_path(args.font.clone(), 0).unwrap();
+            let img = image::open(img).unwrap();
+            let lines = decode_image_vec(&img, &font, &args.alphabet, decode_options, render_options);
+            (i, lines)
+        }).collect();
+        liness.sort();
+        for (_, lines) in liness {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+    }
+
+
 }
+
+//fn test_image() {
+//    let size = 13.0;
+//    let kern_x = 1.125;
+//
+//
+//    let font = Font::from_path("Courier New.otf", 0).unwrap();
+//
+//    let canvas = render(&font, text, render_options);
+//
+//    let image = canvas_to_rgba8(&canvas);
+//    image.save("font_kit.png").unwrap();
+//
+//    let mut pixels = canvas.pixels.clone();
+//    for px in pixels.iter_mut() {
+//        *px = 255 - *px;
+//    }
+//    canvas_to_lum8(&canvas).save("font_kit-l8.png").unwrap();
+//
+//    let mut _base_image = image::open("imgs-000.png")
+//        .unwrap();
+//    let _base_image = _base_image
+//        //.crop_imm(45, 48 - 9, 608, 12)
+//        //.crop_imm(45, 48 - 9 + 0, 608, 12)
+//        .crop_imm(45, 48 - 9 + 0, 608, 12)
+//        .into_rgba8();
+//
+//    let x_start = 45;
+//    let y_start = 48 - 9;
+//    let width = 608;
+//    let height = 12;
+//    let reference_image = image::open("imgs-000.png")
+//        .unwrap()
+//        .crop_imm(x_start, y_start, width, height)
+//        .into_luma8();
+//    reference_image.save("foo.png").unwrap();
+//
+//}
+//
