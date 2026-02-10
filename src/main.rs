@@ -223,6 +223,27 @@ fn decode_image(
     }
 }
 
+fn decode_image_vec(
+    ref_img: &DynamicImage,
+    font: &Font,
+    alphabet: &str,
+    decode_options: DecodeOptions,
+    render_options: RenderOptions,
+) -> Vec<DecodedLine> {
+    let mut ret = Vec::with_capacity(128);
+    decode_image(
+        ref_img,
+        font,
+        alphabet,
+        decode_options,
+        render_options,
+        |line| {
+            ret.push(line);
+        },
+    );
+    ret
+}
+
 fn draw_test_rectangles(img: &DynamicImage, decode_options: DecodeOptions) -> DynamicImage {
     let DecodeOptions {
         x_start,
@@ -289,27 +310,6 @@ fn draw_test_text(
     img_line.into()
 }
 
-fn decode_image_vec(
-    ref_img: &DynamicImage,
-    font: &Font,
-    alphabet: &str,
-    decode_options: DecodeOptions,
-    render_options: RenderOptions,
-) -> Vec<DecodedLine> {
-    let mut ret = Vec::with_capacity(128);
-    decode_image(
-        ref_img,
-        font,
-        alphabet,
-        decode_options,
-        render_options,
-        |line| {
-            ret.push(line);
-        },
-    );
-    ret
-}
-
 fn draw_verify(
     ref_img: &DynamicImage,
     lines: &[DecodedLine],
@@ -319,9 +319,9 @@ fn draw_verify(
 ) -> DynamicImage {
     let ref_img = ref_img.clone().into_luma8();
     let mut out = RgbImage::new(ref_img.width(), ref_img.height());
-    for px in out.pixels_mut() {
-        *px = Rgb([255, 255, 255]);
-    }
+    //for px in out.pixels_mut() {
+    //    *px = Rgb([255, 255, 255]);
+    //}
 
     for (src, dst) in ref_img.pixels().zip(out.pixels_mut()) {
         if src[0] != 255 {
@@ -334,7 +334,7 @@ fn draw_verify(
         for (x, y, px) in img_text.enumerate_pixels() {
             if px[0] != 255 {
                 let out_px = out.get_pixel_mut(decode_options.x_start + x, line.y + y);
-                out_px[2] = px[0];
+                *out_px = Rgb([out_px[0], 0, px[0]]);
             }
         }
     }
@@ -471,7 +471,7 @@ fn main() {
                         let out = Path::new(&verify_dir).join(name.file_name().unwrap());
                         let img = draw_verify(&img, &lines, font, decode_options, render_options);
                         img.save(out).unwrap();
-                        let diff = red_blue_mse(&img.as_rgb8().unwrap());
+                        let diff = red_blue_mse(img.as_rgb8().unwrap());
                         eprintln!("{img_path} {diff:.6}");
                     }
                     (i, lines)
