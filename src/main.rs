@@ -2,7 +2,7 @@ use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{DynamicImage, GrayImage, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, Rgba, Pixel};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
@@ -221,6 +221,65 @@ fn decode_image(
         cb(line);
     }
 }
+
+fn draw_test_rectangles(img: &DynamicImage, decode_options: DecodeOptions) -> DynamicImage {
+    let DecodeOptions {
+        x_start,
+        y_start,
+        line_advance,
+        width,
+        line_height,
+    } = decode_options;
+    let mut ret = img.clone().into_rgba8();
+    for i in 0..u32::MAX {
+        let img_line = img
+            .crop_imm(x_start, y_start + i * line_advance, width, line_height)
+            .into_luma8();
+        if img_line.height() == 0 {
+            break;
+        }
+        if img_line.as_raw().iter().all(|x| *x == 255) {
+            continue;
+        }
+        // horizontal
+        let y = y_start + i * line_advance;
+        for x in x_start..=x_start+width {
+            ret.get_pixel_mut(x, y).blend(&Rgba([255, 0, 0, 128]));
+            ret.get_pixel_mut(x, y + line_height).blend(&Rgba([255, 0, 0, 128]));
+        }
+        // vertical
+        for y in y..=(y + line_height) {
+            ret.get_pixel_mut(x_start, y).blend(&Rgba([255, 0, 0, 128]));
+            ret.get_pixel_mut(x_start + width, y).blend(&Rgba([255, 0, 0, 128]));
+        }
+    }
+    ret.into()
+}
+
+fn draw_test_text(font: &Font, text: &str, img: &DynamicImage, decode_options: DecodeOptions, render_options: RenderOptions) -> DynamicImage {
+    let DecodeOptions {
+        x_start,
+        y_start,
+        width,
+        line_height,
+        line_advance: _line_advance,
+    } = decode_options;
+    let mut img_line = img
+        .crop_imm(x_start, y_start, width, line_height)
+        .into_rgba8();
+    let img_text = canvas_to_lum8(&render(font, text, render_options));
+    for x in 0..img_line.width().min(img_text.width()) {
+        for y in 0..img_line.height().min(img_text.height()) {
+            let c = img_text.get_pixel(x, y)[0];
+            if c == 255 {
+                continue;
+            }
+            img_line.get_pixel_mut(x, y).blend(&Rgba([c, 0, 0, 128]));
+        }
+    }
+    img_line.into()
+}
+
 fn decode_image_vec(
     ref_img: &DynamicImage,
     font: &Font,
@@ -235,27 +294,8 @@ fn decode_image_vec(
     ret
 }
 
-#[allow(unused)]
-fn canvas_to_rgba8(canvas: &Canvas) -> RgbaImage {
-    let w = canvas.size.x() as usize;
-    let h = canvas.size.y() as usize;
-
-    let mut image = DynamicImage::new_rgba8(w as u32, h as u32).to_rgba8();
-    for y in 0..h {
-        let row = &canvas.pixels[y * canvas.stride..(y + 1) * canvas.stride];
-        for x in 0..w {
-            let c = 255 - row[x];
-            if c != 255 {
-                let color = Rgba([c, c, c, 255]);
-                image.put_pixel(x as u32, y as u32, color);
-            }
-        }
-    }
-    image
-}
-
-#[allow(unused)]
 fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
+    assert!(canvas.format == Format::A8);
     let w = canvas.size.x() as u32;
     let h = canvas.size.y() as u32;
     let mut pixels = canvas.pixels.clone();
@@ -303,6 +343,9 @@ struct Args {
 
     #[arg(long)]
     debug: bool,
+
+    #[arg(long)]
+    test: Option<String>,
 }
 
 fn main() {
@@ -330,6 +373,17 @@ fn main() {
         line_advance: args.line_advance,
     };
 
+    if let Some(test_outfile) = args.test {
+        let img = image::open(args.img.first().unwrap()).unwrap();
+        let out = draw_test_rectangles(&img, decode_options);
+        out.save(format!("{test_outfile}-rect.png")).unwrap();
+
+        let font = Font::from_path(args.font, 0).unwrap();
+        let out = draw_test_text(&font, &args.alphabet, &img, decode_options, render_options);
+        out.save(format!("{test_outfile}-rect.png")).unwrap();
+        return;
+    }
+
     if args.img.len() == 1 {
         let font = Font::from_path(args.font.clone(), 0).unwrap();
         let img = image::open(args.img.first().unwrap()).unwrap();
@@ -352,8 +406,6 @@ fn main() {
             }
         }
     }
-
-
 }
 
 //fn test_image() {
