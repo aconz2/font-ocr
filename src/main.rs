@@ -1,8 +1,10 @@
+use std::path::Path;
+
 use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{DynamicImage, GrayImage, Pixel, Rgba};
+use image::{DynamicImage, GrayImage, Pixel, Rgba, Rgb, RgbImage};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
@@ -27,6 +29,12 @@ struct DecodeOptions {
     line_height: u32,
     line_advance: u32,
     width: u32,
+}
+
+#[derive(Clone)]
+struct DecodedLine {
+    text: String,
+    y: u32,
 }
 
 #[allow(unused)]
@@ -73,14 +81,6 @@ fn render(font: &Font, text: &str, render_options: RenderOptions) -> Canvas {
         .unwrap();
     }
     canvas
-}
-
-fn sum_of_squares(xs: &[u8], ys: &[u8]) -> i64 {
-    assert!(xs.len() == ys.len());
-    xs.iter()
-        .zip(ys)
-        .map(|(x, y)| (*x as i32 - *y as i32).pow(2) as i64)
-        .sum::<i64>()
 }
 
 fn score_glyph(
@@ -192,7 +192,7 @@ fn decode_image(
     alphabet: &str,
     decode_options: DecodeOptions,
     render_options: RenderOptions,
-    mut cb: impl FnMut(String),
+    mut cb: impl FnMut(DecodedLine),
 ) {
     let DecodeOptions {
         x_start,
@@ -203,8 +203,9 @@ fn decode_image(
     } = decode_options;
 
     for i in 0..u32::MAX {
+        let y = y_start + i * line_advance;
         let img_line = ref_img
-            .crop_imm(x_start, y_start + i * line_advance, width, line_height)
+            .crop_imm(x_start, y, width, line_height)
             .into_luma8();
 
         if img_line.height() == 0 {
@@ -214,11 +215,11 @@ fn decode_image(
             //eprintln!("whitespace line");
             continue;
         }
-        let line = decode_line(&img_line, font, alphabet, render_options);
-        if line.is_empty() {
+        let text = decode_line(&img_line, font, alphabet, render_options);
+        if text.is_empty() {
             break;
         }
-        cb(line);
+        cb(DecodedLine {text, y});
     }
 }
 
@@ -294,7 +295,7 @@ fn decode_image_vec(
     alphabet: &str,
     decode_options: DecodeOptions,
     render_options: RenderOptions,
-) -> Vec<String> {
+) -> Vec<DecodedLine> {
     let mut ret = Vec::with_capacity(128);
     decode_image(
         ref_img,
@@ -307,6 +308,37 @@ fn decode_image_vec(
         },
     );
     ret
+}
+
+fn draw_verify(
+    ref_img: &DynamicImage,
+    lines: &[DecodedLine],
+    font: &Font,
+    decode_options: DecodeOptions,
+    render_options: RenderOptions,
+) -> DynamicImage {
+    let ref_img = ref_img.clone().into_luma8();
+    let mut out = RgbImage::new(ref_img.width(), ref_img.height());
+    for px in out.pixels_mut() {
+        *px = Rgb([255, 255, 255]);
+    }
+
+    for (src, dst) in ref_img.pixels().zip(out.pixels_mut()) {
+        if src[0] != 255 {
+            *dst = Rgb([src[0], 0, 0]);
+        }
+    }
+
+    for line in lines {
+        let img_text = canvas_to_lum8(&render(font, &line.text, render_options));
+        for (x, y, px) in img_text.enumerate_pixels() {
+            if px[0] != 255 {
+                let out_px = out.get_pixel_mut(decode_options.x_start + x, line.y + y);
+                out_px[2] = px[0];
+            }
+        }
+    }
+    out.into()
 }
 
 fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
@@ -356,16 +388,21 @@ struct Args {
     #[arg(long)]
     line_advance: u32,
 
-    #[arg(long)]
-    debug: bool,
-
     /// Prefix for output test images; creates <prefix>-rect.png and <prefix>-text.png
     #[arg(long)]
     test: Option<String>,
+
+    /// Dir for verify images. Red is reference, Blue is rendered
+    #[arg(long)]
+    verify: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(ref verify_dir) = args.verify {
+        assert!(Path::new(&verify_dir).is_dir(), "--verify should be a dir");
+    }
 
     let hinting = if args.hinting {
         HintingOptions::Full(args.text_size)
@@ -396,11 +433,11 @@ fn main() {
 
         let font = Font::from_path(args.font, 0).unwrap();
         let out = draw_test_text(&font, &args.alphabet, &img, decode_options, render_options);
-        out.save(format!("{test_outfile}-rect.png")).unwrap();
+        out.save(format!("{test_outfile}-text.png")).unwrap();
         return;
     }
 
-    if args.img.len() == 1 {
+    if args.img.len() == 1 && args.verify.is_none() {
         let font = Font::from_path(args.font.clone(), 0).unwrap();
         let img = image::open(args.img.first().unwrap()).unwrap();
 
@@ -411,7 +448,7 @@ fn main() {
             decode_options,
             render_options,
             |line| {
-                println!("{line}");
+                println!("{}", line.text);
             },
         );
     } else {
@@ -420,8 +457,8 @@ fn main() {
             .into_par_iter()
             .map_init(
                 || Font::from_path(args.font.clone(), 0).unwrap(),
-                |font, (i, img)| {
-                    let img = image::open(img).unwrap();
+                |font, (i, img_path)| {
+                    let img = image::open(&img_path).unwrap();
                     let lines = decode_image_vec(
                         &img,
                         font,
@@ -429,13 +466,21 @@ fn main() {
                         decode_options,
                         render_options,
                     );
+                    if let Some(verify_dir) = &args.verify {
+                        let name = Path::new(&img_path).with_extension("png");
+                        let out = Path::new(&verify_dir).join(name.file_name().unwrap());
+                        let img = draw_verify(&img, &lines, font, decode_options, render_options);
+                        img.save(out).unwrap();
+                        let diff = red_blue_mse(&img.as_rgb8().unwrap());
+                        eprintln!("{img_path} {diff:.6}");
+                    }
                     (i, lines)
                 },
             )
             .collect();
-        liness.sort();
+        liness.sort_by_key(|(i, _)| *i);
         for line in liness.iter().flat_map(|(_i, lines)| lines) {
-            println!("{line}");
+            println!("{}", line.text);
         }
         // version with std::thread
         //use std::thread;
@@ -474,3 +519,19 @@ fn main() {
         //});
     }
 }
+
+fn sum_of_squares(xs: &[u8], ys: &[u8]) -> i64 {
+    assert!(xs.len() == ys.len());
+    xs.iter()
+        .zip(ys)
+        .map(|(x, y)| (*x as i32 - *y as i32).pow(2) as i64)
+        .sum::<i64>()
+}
+
+fn red_blue_mse(img: &RgbImage) -> f32 {
+    let v = img.pixels()
+        .map(|px| (px[0] as i32 - px[2] as i32).pow(2) as i64)
+        .sum::<i64>() as f32;
+    v / ((img.width() * img.height()) as f32)
+}
+
