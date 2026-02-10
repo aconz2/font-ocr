@@ -94,16 +94,6 @@ fn score_glyph(
 ) -> i64 {
     canvas.pixels.fill(0);
 
-    let _raster_rect = font
-        .raster_bounds(
-            gid,
-            render_options.size,
-            Transform2F::from_translation(pos),
-            render_options.hinting,
-            render_options.rasterization,
-        )
-        .unwrap();
-
     font.rasterize_glyph(
         canvas,
         gid,
