@@ -2,7 +2,7 @@ use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{DynamicImage, GrayImage, Rgba, Pixel};
+use image::{DynamicImage, GrayImage, Pixel, Rgba};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
@@ -192,7 +192,7 @@ fn decode_image(
     alphabet: &str,
     decode_options: DecodeOptions,
     render_options: RenderOptions,
-    mut cb: impl FnMut(String)
+    mut cb: impl FnMut(String),
 ) {
     let DecodeOptions {
         x_start,
@@ -214,7 +214,7 @@ fn decode_image(
             //eprintln!("whitespace line");
             continue;
         }
-        let line = decode_line(&img_line, &font, alphabet, render_options);
+        let line = decode_line(&img_line, font, alphabet, render_options);
         if line.is_empty() {
             break;
         }
@@ -243,20 +243,28 @@ fn draw_test_rectangles(img: &DynamicImage, decode_options: DecodeOptions) -> Dy
         }
         // horizontal
         let y = y_start + i * line_advance;
-        for x in x_start..=x_start+width {
+        for x in x_start..=x_start + width {
             ret.get_pixel_mut(x, y).blend(&Rgba([255, 0, 0, 128]));
-            ret.get_pixel_mut(x, y + line_height).blend(&Rgba([255, 0, 0, 128]));
+            ret.get_pixel_mut(x, y + line_height)
+                .blend(&Rgba([255, 0, 0, 128]));
         }
         // vertical
         for y in y..=(y + line_height) {
             ret.get_pixel_mut(x_start, y).blend(&Rgba([255, 0, 0, 128]));
-            ret.get_pixel_mut(x_start + width, y).blend(&Rgba([255, 0, 0, 128]));
+            ret.get_pixel_mut(x_start + width, y)
+                .blend(&Rgba([255, 0, 0, 128]));
         }
     }
     ret.into()
 }
 
-fn draw_test_text(font: &Font, text: &str, img: &DynamicImage, decode_options: DecodeOptions, render_options: RenderOptions) -> DynamicImage {
+fn draw_test_text(
+    font: &Font,
+    text: &str,
+    img: &DynamicImage,
+    decode_options: DecodeOptions,
+    render_options: RenderOptions,
+) -> DynamicImage {
     let DecodeOptions {
         x_start,
         y_start,
@@ -288,9 +296,16 @@ fn decode_image_vec(
     render_options: RenderOptions,
 ) -> Vec<String> {
     let mut ret = Vec::with_capacity(128);
-    decode_image(ref_img, font, alphabet, decode_options, render_options, |line| {
-        ret.push(line);
-    });
+    decode_image(
+        ref_img,
+        font,
+        alphabet,
+        decode_options,
+        render_options,
+        |line| {
+            ret.push(line);
+        },
+    );
     ret
 }
 
@@ -302,7 +317,7 @@ fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
     for px in pixels.iter_mut() {
         *px = 255 - *px;
     }
-    GrayImage::from_raw(w as u32, h as u32, pixels).unwrap()
+    GrayImage::from_raw(w, h, pixels).unwrap()
 }
 
 #[derive(Parser, Debug)]
@@ -344,6 +359,7 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
+    /// Prefix for output test images; creates <prefix>-rect.png and <prefix>-text.png
     #[arg(long)]
     test: Option<String>,
 }
@@ -388,61 +404,73 @@ fn main() {
         let font = Font::from_path(args.font.clone(), 0).unwrap();
         let img = image::open(args.img.first().unwrap()).unwrap();
 
-        decode_image(&img, &font, &args.alphabet, decode_options, render_options, |line| {
-            println!("{line}");
-        });
+        decode_image(
+            &img,
+            &font,
+            &args.alphabet,
+            decode_options,
+            render_options,
+            |line| {
+                println!("{line}");
+            },
+        );
     } else {
         let imgs: Vec<_> = args.img.into_iter().enumerate().collect();
-        let mut liness: Vec<_> = imgs.into_par_iter().map(|(i, img)| {
-            let font = Font::from_path(args.font.clone(), 0).unwrap();
-            let img = image::open(img).unwrap();
-            let lines = decode_image_vec(&img, &font, &args.alphabet, decode_options, render_options);
-            (i, lines)
-        }).collect();
+        let mut liness: Vec<_> = imgs
+            .into_par_iter()
+            .map_init(
+                || Font::from_path(args.font.clone(), 0).unwrap(),
+                |font, (i, img)| {
+                    let img = image::open(img).unwrap();
+                    let lines = decode_image_vec(
+                        &img,
+                        font,
+                        &args.alphabet,
+                        decode_options,
+                        render_options,
+                    );
+                    (i, lines)
+                },
+            )
+            .collect();
         liness.sort();
-        for (_, lines) in liness {
-            for line in lines {
-                println!("{line}");
-            }
+        for line in liness.iter().flat_map(|(_i, lines)| lines) {
+            println!("{line}");
         }
+        // version with std::thread
+        //use std::thread;
+        //thread::scope(|s| {
+        //    let lines = args
+        //        .img
+        //        .chunks(
+        //            args.threads
+        //                .unwrap_or_else(|| thread::available_parallelism().unwrap().into()),
+        //        )
+        //        .map(|imgs| {
+        //            let font = args.font.clone();
+        //            let alphabet = args.alphabet.clone();
+        //            s.spawn(move || {
+        //                let font = Font::from_path(&font, 0).unwrap();
+        //                imgs.iter()
+        //                    .map(|img| {
+        //                        let img = image::open(img).unwrap();
+        //                        decode_image_vec(
+        //                            &img,
+        //                            &font,
+        //                            &alphabet,
+        //                            decode_options,
+        //                            render_options,
+        //                        )
+        //                    })
+        //                    .collect::<Vec<_>>()
+        //            })
+        //        })
+        //        .map(|t| t.join().unwrap())
+        //        .flatten()
+        //        .flatten()
+        //        .for_each(|line| {
+        //            println!("{}", line);
+        //        });
+        //});
     }
 }
-
-//fn test_image() {
-//    let size = 13.0;
-//    let kern_x = 1.125;
-//
-//
-//    let font = Font::from_path("Courier New.otf", 0).unwrap();
-//
-//    let canvas = render(&font, text, render_options);
-//
-//    let image = canvas_to_rgba8(&canvas);
-//    image.save("font_kit.png").unwrap();
-//
-//    let mut pixels = canvas.pixels.clone();
-//    for px in pixels.iter_mut() {
-//        *px = 255 - *px;
-//    }
-//    canvas_to_lum8(&canvas).save("font_kit-l8.png").unwrap();
-//
-//    let mut _base_image = image::open("imgs-000.png")
-//        .unwrap();
-//    let _base_image = _base_image
-//        //.crop_imm(45, 48 - 9, 608, 12)
-//        //.crop_imm(45, 48 - 9 + 0, 608, 12)
-//        .crop_imm(45, 48 - 9 + 0, 608, 12)
-//        .into_rgba8();
-//
-//    let x_start = 45;
-//    let y_start = 48 - 9;
-//    let width = 608;
-//    let height = 12;
-//    let reference_image = image::open("imgs-000.png")
-//        .unwrap()
-//        .crop_imm(x_start, y_start, width, height)
-//        .into_luma8();
-//    reference_image.save("foo.png").unwrap();
-//
-//}
-//
