@@ -4,7 +4,7 @@ use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{DynamicImage, GrayImage, Pixel, Rgba, Rgb, RgbImage};
+use image::{DynamicImage, GrayImage, Pixel, Rgb, RgbImage, Rgba};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
@@ -209,7 +209,7 @@ fn decode_image(
         if text.is_empty() {
             break;
         }
-        cb(DecodedLine {text, y});
+        cb(DecodedLine { text, y });
     }
 }
 
@@ -519,9 +519,9 @@ fn sum_of_squares(xs: &[u8], ys: &[u8]) -> i64 {
 }
 
 fn red_blue_mse(img: &RgbImage) -> f32 {
-    let v = img.pixels()
+    let v = img
+        .pixels()
         .map(|px| (px[0] as i32 - px[2] as i32).pow(2) as i64)
         .sum::<i64>() as f32;
     v / ((img.width() * img.height()) as f32)
 }
-
