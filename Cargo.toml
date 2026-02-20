@@ -13,3 +13,6 @@ rayon = "1.11.0"
 [[bin]]
 name = "brute"
 path = "src/brute.rs"
+
+[profile.release]
+debug = "line-tables-only"
