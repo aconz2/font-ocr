@@ -37,7 +37,6 @@ struct DecodedLine {
     y: u32,
 }
 
-#[allow(unused)]
 fn render(font: &Font, text: &str, render_options: RenderOptions) -> Canvas {
     assert!(render_options.format == Format::A8);
 
@@ -243,6 +242,7 @@ fn draw_test_rectangles(img: &DynamicImage, decode_options: DecodeOptions) -> Dy
         line_height,
     } = decode_options;
     let mut ret = img.clone().into_rgba8();
+    let c = Rgba([255, 0, 0, 128]);
     for i in 0..u32::MAX {
         let img_line = img
             .crop_imm(x_start, y_start + i * line_advance, width, line_height)
@@ -256,15 +256,15 @@ fn draw_test_rectangles(img: &DynamicImage, decode_options: DecodeOptions) -> Dy
         // horizontal
         let y = y_start + i * line_advance;
         for x in x_start..=x_start + width {
-            ret.get_pixel_mut(x, y).blend(&Rgba([255, 0, 0, 128]));
+            ret.get_pixel_mut(x, y).blend(&c);
             ret.get_pixel_mut(x, y + line_height)
-                .blend(&Rgba([255, 0, 0, 128]));
+                .blend(&c);
         }
         // vertical
         for y in y..=(y + line_height) {
-            ret.get_pixel_mut(x_start, y).blend(&Rgba([255, 0, 0, 128]));
+            ret.get_pixel_mut(x_start, y).blend(&c);
             ret.get_pixel_mut(x_start + width, y)
-                .blend(&Rgba([255, 0, 0, 128]));
+                .blend(&c);
         }
     }
     ret.into()
@@ -284,8 +284,8 @@ fn draw_test_text(
         line_height,
         line_advance: _line_advance,
     } = decode_options;
-    let mut img_line = img
-        .crop_imm(x_start, y_start, width, line_height)
+    let mut img_line = img.clone()
+        //.crop_imm(x_start, y_start, width, line_height)
         .into_rgba8();
     let img_text = canvas_to_lum8(&render(font, text, render_options));
     for x in 0..img_line.width().min(img_text.width()) {
