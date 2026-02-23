@@ -13,7 +13,7 @@ Requires `pdfimages` from `poppler-utils` and `Courier New.otf`
 # let's say you have a certain input.pdf with embedded images
 mkdir -p imgs verify
 pdfimages input.pdf imgs/page
-cargo run --release -- -i imgs/* -f 'Courier New.otf' -t 13 -k 1.125 -x 45 -y 39 -w 608 --line-height 12 --line-advance 15 --verify verify > out
+cargo run --bin focr --release -- -i imgs/* -f 'Courier New.otf' -t 13 -x 45 -y 39 -w 608 --line-height 12 --line-advance 15 --verify verify > out
 
 # cleanup out file by removing garbage from beginning and end
 # manually add first line as
@@ -40,5 +40,3 @@ I thought there should be a way to only render a small character-sized canvas an
 I made no attempts to cache rendered glyphs. This would work better if rendering to a character-sized canvas, though the cache would still need to be keyed off `(glyph, subpixel_position)` (is that what real renderers do?). In general, caching a glyph per position on the line is possible, but could get large in size if the font isn't monospace.
 
 There is no font shaping.
-
-A kerning scaler proved essential to getting this to work in the example. This eliminated a lot of easier looking API's.

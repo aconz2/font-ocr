@@ -39,6 +39,7 @@ struct DecodedLine {
 
 fn render(font: &Font, text: &str, render_options: RenderOptions) -> Canvas {
     assert!(render_options.format == Format::A8);
+    let units_per_em = font.metrics().units_per_em as f32;
 
     let mut glyph_pos = Vec::with_capacity(text.len());
 
@@ -47,7 +48,8 @@ fn render(font: &Font, text: &str, render_options: RenderOptions) -> Canvas {
     for char in text.chars() {
         let glyph_id = font.glyph_for_char(char).unwrap();
         glyph_pos.push((glyph_id, pos));
-        pos += font.advance(glyph_id).unwrap() * render_options.size / 24. / 96.
+        pos += font.advance(glyph_id).unwrap() / units_per_em
+            * render_options.size
             * render_options.kern_x;
     }
 
@@ -116,6 +118,8 @@ fn decode_line(
     let (w, h) = reference.dimensions();
     let mut canvas = Canvas::new(Vector2I::new(w as i32, h as i32), render_options.format);
 
+    let units_per_em = font.metrics().units_per_em as f32;
+
     let mut pos = Vector2F::default();
 
     let char_gids: Vec<_> = alphabet
@@ -169,8 +173,9 @@ fn decode_line(
 
         s.push(*c);
 
-        pos +=
-            font.advance(*gid).unwrap() * render_options.size / 24. / 96. * render_options.kern_x;
+        pos += font.advance(*gid).unwrap() / units_per_em
+            * render_options.size
+            * render_options.kern_x;
     }
     s
 }
