@@ -7,30 +7,31 @@ use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
 use image::{DynamicImage, GrayImage, Luma, imageops};
-use pathfinder_geometry::rect::{RectF,RectI};
+use pathfinder_geometry::rect::{RectF, RectI};
 use pathfinder_geometry::transform2d::Transform2F;
-use pathfinder_geometry::vector::{Vector2F,Vector2I};
+use pathfinder_geometry::vector::{Vector2F, Vector2I};
 
-const DEFAULT_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=+(){};:";
+const DEFAULT_ALPHABET: &str =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=+(){};:";
 
-//#[derive(Clone, Copy)]
-//enum BoxSize {
-//    Font,
-//    Alphabet,
-//    Char
-//}
-//
-//impl TryFrom<&str> for BoxSize {
-//    type Error = ();
-//    fn try_from(s: &str) -> Result<BoxSize, ()> {
-//        match s {
-//            "font" => Ok(BoxSize::Font),
-//            "alphabet" => Ok(BoxSize::Alphabet),
-//            "char" => Ok(BoxSize::Char),
-//            _ => Err(())
-//        }
-//    }
-//}
+#[derive(Clone, Copy)]
+enum BoxSize {
+    Font,
+    Alphabet,
+    Char,
+}
+
+impl TryFrom<&str> for BoxSize {
+    type Error = ();
+    fn try_from(s: &str) -> Result<BoxSize, ()> {
+        match s {
+            "font" => Ok(BoxSize::Font),
+            "alphabet" => Ok(BoxSize::Alphabet),
+            "char" => Ok(BoxSize::Char),
+            _ => Err(()),
+        }
+    }
+}
 //
 //#[derive(Clone, Copy)]
 //enum Baseline {
@@ -63,16 +64,21 @@ struct Searcher {
     matches: Vec<Match>,
 }
 
-fn render(font: &Font, char: char, offset: [f32; 2], render_options: RenderOptions, canvas: Option<Canvas>) -> Canvas {
+fn render(
+    font: &Font,
+    char: char,
+    offset: [f32; 2],
+    render_options: RenderOptions,
+    canvas_size: Option<Vector2I>,
+    canvas: Option<Canvas>,
+    padding: Vector2I,
+) -> Canvas {
     assert!(render_options.format == Format::A8);
 
     let glyph_id = font.glyph_for_char(char).unwrap();
     let pos = Vector2F::new(offset[0], offset[1]);
 
-    let to_px = (1. / font.metrics().units_per_em as f32) * render_options.size;
-
-    let bounds = font
-        .raster_bounds(
+    let raster_bounds = font.raster_bounds(
             glyph_id,
             render_options.size,
             Transform2F::from_translation(pos),
@@ -80,26 +86,26 @@ fn render(font: &Font, char: char, offset: [f32; 2], render_options: RenderOptio
             render_options.rasterization,
         )
         .unwrap();
-    let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * to_px;
-    let _bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
-    let bearing_x = glyph_bounds.origin().x();
-    let ascent_px = font.metrics().ascent * to_px;
 
-    let size = if true {
-        bounds.size()
+    let size = canvas_size.unwrap_or_else(|| {
+        raster_bounds.size()
+    }) + padding * 2;
+
+    let origin = if canvas_size.is_some() { // BoxSize::Font | Alphabet
+        Vector2F::new(0., 0.)
     } else {
-        let font_bbox = font.metrics().bounding_box * to_px;
-        Vector2I::new(
-            font_bbox.width().ceil() as i32,
-            font_bbox.height().ceil() as i32,
-            )
+        //let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * to_px;
+    //let bearing_x = glyph_bounds.origin().x();
+        //let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
+        //bearing_y.ceil()
+        -raster_bounds.origin().to_f32()
     };
 
     let mut canvas = match canvas {
         Some(mut canvas) if canvas.size == size && canvas.format == Format::A8 => {
             canvas.pixels.fill(0);
             canvas
-        },
+        }
         _ => Canvas::new(size, render_options.format),
     };
 
@@ -107,7 +113,7 @@ fn render(font: &Font, char: char, offset: [f32; 2], render_options: RenderOptio
         &mut canvas,
         glyph_id,
         render_options.size,
-        Transform2F::from_translation(-bounds.to_f32().origin()).translate(pos),
+        Transform2F::from_translation(origin).translate(padding.to_f32()).translate(pos),
         //Transform2F::from_translation(Vector2F::new(bearing_x.floor(), ascent_px.ceil())).translate(pos),
         render_options.hinting,
         render_options.rasterization,
@@ -116,78 +122,78 @@ fn render(font: &Font, char: char, offset: [f32; 2], render_options: RenderOptio
     canvas
 }
 
-fn render_string(
-    font: &Font,
-    text: &str,
-    offset: [f32; 2],
-    render_options: RenderOptions,
-    canvas: Option<Canvas>,
-) -> Canvas {
-    assert!(render_options.format == Format::A8);
-    let units_per_em = font.metrics().units_per_em as f32;
-
-    let mut glyph_pos = Vec::with_capacity(text.len());
-
-    let mut pos = Vector2F::new(offset[0], offset[1]);
-
-    for char in text.chars() {
-        let glyph_id = font.glyph_for_char(char).unwrap();
-        glyph_pos.push((glyph_id, pos));
-        pos += font.advance(glyph_id).unwrap() / units_per_em * render_options.size;
-        let bounds = font.typographic_bounds(glyph_id).unwrap() * (1. / units_per_em) * render_options.size;
-        let bounds2 = font.typographic_bounds(glyph_id).unwrap();
-        eprintln!("{char} {bounds:?} {bounds2:?}");
-    }
-
-    let bounds = glyph_pos
-        .iter()
-        .fold(RectF::default(), |bounds, (glyph_id, pos)| {
-            let raster_rect = font
-                .raster_bounds(
-                    *glyph_id,
-                    render_options.size,
-                    Transform2F::from_translation(*pos),
-                    render_options.hinting,
-                    render_options.rasterization,
-                )
-                .unwrap();
-            eprintln!("raster rect {raster_rect:?}");
-            bounds.union_rect(raster_rect.to_f32())
-        });
-
-    eprintln!("bounds `{}` {:?}", text, bounds);
-    let font_bbox = font.metrics().bounding_box * (1. / units_per_em) * render_options.size;
-    eprintln!("font_bbox {:?} height={}", font_bbox, font_bbox.height());
-
-    let size = Vector2I::new(
-        bounds.width().ceil() as i32,
-        //font_bbox.height().ceil() as i32,
-        font_bbox.height().ceil() as i32,
-        //bounds.height().ceil() as i32,
-    );
-
-    let mut canvas = match canvas {
-        Some(canvas) if canvas.size == size => { canvas },
-        _ => Canvas::new(size, render_options.format),
-    };
-
-    for (glyph_id, pos) in glyph_pos {
-        let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * (1. / units_per_em) * render_options.size;
-        let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
-        eprintln!("bearing_y {bearing_y}");
-        //eprintln!("pos={:?}", pos);
-        font.rasterize_glyph(
-            &mut canvas,
-            glyph_id,
-            render_options.size,
-            Transform2F::from_translation(-bounds.origin()).translate(pos),
-            render_options.hinting,
-            render_options.rasterization,
-        )
-        .unwrap();
-    }
-    canvas
-}
+//fn render_string(
+//    font: &Font,
+//    text: &str,
+//    offset: [f32; 2],
+//    render_options: RenderOptions,
+//    canvas: Option<Canvas>,
+//) -> Canvas {
+//    assert!(render_options.format == Format::A8);
+//    let units_per_em = font.metrics().units_per_em as f32;
+//
+//    let mut glyph_pos = Vec::with_capacity(text.len());
+//
+//    let mut pos = Vector2F::new(offset[0], offset[1]);
+//
+//    for char in text.chars() {
+//        let glyph_id = font.glyph_for_char(char).unwrap();
+//        glyph_pos.push((glyph_id, pos));
+//        pos += font.advance(glyph_id).unwrap() / units_per_em * render_options.size;
+//        let bounds = font.typographic_bounds(glyph_id).unwrap() * (1. / units_per_em) * render_options.size;
+//        let bounds2 = font.typographic_bounds(glyph_id).unwrap();
+//        eprintln!("{char} {bounds:?} {bounds2:?}");
+//    }
+//
+//    let bounds = glyph_pos
+//        .iter()
+//        .fold(RectF::default(), |bounds, (glyph_id, pos)| {
+//            let raster_rect = font
+//                .raster_bounds(
+//                    *glyph_id,
+//                    render_options.size,
+//                    Transform2F::from_translation(*pos),
+//                    render_options.hinting,
+//                    render_options.rasterization,
+//                )
+//                .unwrap();
+//            eprintln!("raster rect {raster_rect:?}");
+//            bounds.union_rect(raster_rect.to_f32())
+//        });
+//
+//    eprintln!("bounds `{}` {:?}", text, bounds);
+//    let font_bbox = font.metrics().bounding_box * (1. / units_per_em) * render_options.size;
+//    eprintln!("font_bbox {:?} height={}", font_bbox, font_bbox.height());
+//
+//    let size = Vector2I::new(
+//        bounds.width().ceil() as i32,
+//        //font_bbox.height().ceil() as i32,
+//        font_bbox.height().ceil() as i32,
+//        //bounds.height().ceil() as i32,
+//    );
+//
+//    let mut canvas = match canvas {
+//        Some(canvas) if canvas.size == size => { canvas },
+//        _ => Canvas::new(size, render_options.format),
+//    };
+//
+//    for (glyph_id, pos) in glyph_pos {
+//        let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * (1. / units_per_em) * render_options.size;
+//        let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
+//        eprintln!("bearing_y {bearing_y}");
+//        //eprintln!("pos={:?}", pos);
+//        font.rasterize_glyph(
+//            &mut canvas,
+//            glyph_id,
+//            render_options.size,
+//            Transform2F::from_translation(-bounds.origin()).translate(pos),
+//            render_options.hinting,
+//            render_options.rasterization,
+//        )
+//        .unwrap();
+//    }
+//    canvas
+//}
 
 fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
     assert!(canvas.format == Format::A8);
@@ -245,7 +251,6 @@ impl Searcher {
         let matches = Vec::with_capacity(1024);
         let acc = vec![0f32; img.width() as usize];
         let needle = vec![0; 1024];
-        //let needlex2 = vec![[0; 16]; 12];
 
         Searcher {
             reference: reference.into(),
@@ -258,6 +263,7 @@ impl Searcher {
         }
     }
 
+    // rotating is marginally faster 3% ish so maybe not worthwhile
     fn search(&mut self, needle: &GrayImage, threshold: f32) -> (f32, &[Match]) {
         let w = needle.width();
         let h = needle.height();
@@ -329,7 +335,12 @@ impl Searcher {
     }
 
     #[inline(never)]
-    fn search_n<const N: usize>(&mut self, needle: &GrayImage, threshold: f32, rot: bool) -> (f32, &[Match]) {
+    fn search_n<const N: usize>(
+        &mut self,
+        needle: &GrayImage,
+        threshold: f32,
+        rot: bool,
+    ) -> (f32, &[Match]) {
         assert!(needle.width() <= N as u32);
         self.matches.clear();
 
@@ -371,8 +382,7 @@ impl Searcher {
 
         for y in 0..y_searches {
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
-                let ref_windows =
-                    get_row(&reference, r_w, y + needle_y).array_windows::<N>();
+                let ref_windows = get_row(&reference, r_w, y + needle_y).array_windows::<N>();
                 for (acc, ref_row) in self.acc.iter_mut().zip(ref_windows) {
                     // trying early termination, but not that helpful
                     //if *acc < scaled_threshold {
@@ -387,13 +397,13 @@ impl Searcher {
                     let rect = if rot {
                         RectI::new(
                             Vector2I::new((r_h - y - n_h) as i32, x as i32),
-                            Vector2I::new(n_h as i32, n_w as i32)
-                            )
+                            Vector2I::new(n_h as i32, n_w as i32),
+                        )
                     } else {
                         RectI::new(
                             Vector2I::new(x as i32, y as i32),
-                            Vector2I::new(n_w as i32, n_h as i32)
-                            )
+                            Vector2I::new(n_w as i32, n_h as i32),
+                        )
                     };
                     self.matches.push(Match { mse, rect });
                 }
@@ -466,7 +476,7 @@ struct Args {
     #[arg(short, long)]
     text_size: f32,
 
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(short, long, default_value_t = 0)]
     bits: u32,
 
     #[arg(long)]
@@ -478,12 +488,20 @@ struct Args {
     #[arg(short, long, default_value_t=DEFAULT_ALPHABET.to_string())]
     alphabet: String,
 
-    //#[arg(long, default_value="char")]
-    //box_size: String,
+    #[arg(long, default_value = "char")]
+    box_size: String,
+
+    #[arg(long, default_value_t=0)]
+    padding_x: usize,
+
+    #[arg(long, default_value_t=0)]
+    padding_y: usize,
 }
 
 fn main() {
     let args = Args::parse();
+
+    let padding = Vector2I::new(args.padding_x as i32, args.padding_y as i32);
 
     let hinting = if args.hinting {
         HintingOptions::Full(args.text_size)
@@ -496,8 +514,8 @@ fn main() {
         rasterization: RasterizationOptions::GrayscaleAa,
         size: args.text_size,
         hinting,
-        //box_size: args.box_size.as_str().try_into().unwrap()
     };
+    let box_size = args.box_size.as_str().try_into().unwrap();
 
     //let offsets = [
     //    [0.0, 0.0],
@@ -552,23 +570,24 @@ fn main() {
             let advance = (font.advance(glyph_id).unwrap() * to_px).x();
             let bearing_y = typo_bounds_px.origin().y() + typo_bounds_px.height();
             let bearing_x = typo_bounds_px.origin().x();
-            eprintln!("`{char}` {typo_bounds_px:?}px advance={advance} bearing_x={bearing_x} bearing_y={bearing_y}");
+            eprintln!(
+                "`{char}` {typo_bounds_px:?}px advance={advance} bearing_x={bearing_x} bearing_y={bearing_y}"
+            );
         }
 
-        let alphabet_bbox = args.alphabet.chars()
-            .fold(RectF::default(), |bounds, c| {
-                let gid = font.glyph_for_char(c).unwrap();
-                let raster_rect = font
-                    .raster_bounds(
-                        gid,
-                        render_options.size,
-                        Transform2F::default(),
-                        render_options.hinting,
-                        render_options.rasterization,
-                    )
-                    .unwrap();
-                bounds.union_rect(raster_rect.to_f32())
-            });
+        let alphabet_bbox = args.alphabet.chars().fold(RectF::default(), |bounds, c| {
+            let gid = font.glyph_for_char(c).unwrap();
+            let raster_rect = font
+                .raster_bounds(
+                    gid,
+                    render_options.size,
+                    Transform2F::default(),
+                    render_options.hinting,
+                    render_options.rasterization,
+                )
+                .unwrap();
+            bounds.union_rect(raster_rect.to_f32())
+        });
         eprintln!("alphabet_bbox size {:?}", alphabet_bbox.size());
     }
     let img = image::open(args.img.first().unwrap()).unwrap().into_luma8();
@@ -603,45 +622,98 @@ fn main() {
     //    }
     //    return;
     //}
+    //
+
+    let to_px = (1. / font.metrics().units_per_em as f32) * render_options.size;
 
     let t00 = Instant::now();
 
     let mut canvas_cache = None;
-    for letter in args.alphabet.chars() {
-    //for word in ["J"] {
-        for offset in &offsets {
-            let canvas = render(&font, letter, *offset, render_options, canvas_cache.take());
-            //let canvas = render_string(&font, word, offset, render_options);
+    for offset in &offsets {
+        let (y_offset, canvas_size) = match box_size {
+            BoxSize::Font => {
+                // TODO this doesn't take into account the bbox
+                let bbox = font.metrics().bounding_box * to_px;
+                //let size = Vector2I::new(
+                //    font_bbox.width().ceil() as i32,
+                //    font_bbox.height().ceil() as i32,
+                //    );
+                let size = bbox.round_out().to_i32().size();
+                let y_offset = (font.metrics().ascent * to_px).ceil();
+                (y_offset, Some(size))
+            }
+            BoxSize::Alphabet => {
+                let (y_offset, bbox) =
+                    args.alphabet
+                        .chars()
+                        .fold((0., RectF::default()), |(y_offset, bounds), c| {
+                            let gid = font.glyph_for_char(c).unwrap();
+                            let glyph_bounds = font.typographic_bounds(gid).unwrap() * to_px;
+                            let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
+                            let raster_rect = font
+                                .raster_bounds(
+                                    gid,
+                                    render_options.size,
+                                    Transform2F::from_translation(Vector2F::new(
+                                        offset[0], offset[1],
+                                    )),
+                                    render_options.hinting,
+                                    render_options.rasterization,
+                                )
+                                .unwrap();
+                            (
+                                f32::max(y_offset, bearing_y.ceil()),
+                                bounds.union_rect(raster_rect.to_f32()),
+                            )
+                        });
+                let size = bbox.round_out().to_i32().size();
+                (y_offset, Some(size))
+            }
+            _ => (0., None),
+        };
+        let corrected_offset = [offset[0], offset[1] + y_offset];
+        for letter in args.alphabet.chars() {
+            let canvas = render(
+                &font,
+                letter,
+                corrected_offset,
+                render_options,
+                canvas_size,
+                canvas_cache.take(),
+                padding,
+            );
             let needle = canvas_to_lum8(&canvas);
-            //if false {
+            //if true {
             //    let x = (offset[0] * 1000.) as usize;
             //    let y = (offset[1] * 1000.) as usize;
             //    DynamicImage::ImageLuma8(needle.clone()).save(format!("letters/{letter}-{x}_{y}.png")).unwrap();
             //}
             let t0 = Instant::now();
             let (min, hits) = searcher.search(&needle, args.threshold);
-            //let (min, hits) = searcher.search(&needle, args.threshold);
-            //let (min, hits) = searcher.search8(&needle, args.threshold);
-            //let (min, hits) = searcher.search8x2(&needle, args.threshold);
             let t1 = Instant::now();
             let _ = canvas_cache.insert(canvas);
-            eprintln!("`{letter}` {offset:?} needle size {}x{} min mse {} elapsed {}ms", needle.width(), needle.height(), min, (t1 - t0).as_millis());
-            //eprintln!(
-            //    "`{word}` {offset:?} needle size {}x{} min mse {} elapsed: {}ms",
-            //    needle.width(),
-            //    needle.height(),
-            //    min,
-            //    (t1 - t0).as_millis()
-            //);
+            eprintln!(
+                "`{letter}` {offset:?} needle size {}x{} min mse {} elapsed {}ms",
+                needle.width(),
+                needle.height(),
+                min,
+                (t1 - t0).as_millis()
+            );
             n_hits += hits.len();
 
             let glyph_id = font.glyph_for_char(letter).unwrap();
             let units_per_em = font.metrics().units_per_em as f32;
-            let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * (1. / units_per_em) * render_options.size;
+            let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * to_px;
             let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
             let bearing_x = glyph_bounds.origin().x();
             let ascent_px = font.metrics().ascent * (1. / units_per_em) * render_options.size;
+            let mut last_rect = RectI::default();
             for hit in hits {
+                if hit.rect.intersects(last_rect) {
+                    //eprintln!("skipping");
+                    continue;
+                }
+                last_rect = hit.rect;
                 total_mse += hit.mse;
                 //println!("{hit:?}");
                 //println!("{},{}", hit.x + offset[0], hit.y + offset[1]);
