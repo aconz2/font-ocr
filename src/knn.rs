@@ -7,8 +7,7 @@ use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
 use petal_neighbors::BallTree;
 
-const DEFAULT_ALPHABET: &str =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const DEFAULT_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 #[derive(Clone, Copy)]
 struct RenderOptions {
@@ -168,7 +167,11 @@ fn main() {
             //eprintln!("query {}", (t1 - t0).as_millis());
             if distance < args.threshold {
                 n_hits += 1;
-                println!("{},{}", x as f32 + (n_w as f32 / 2.), y as f32 + (n_h as f32 / 2.));
+                println!(
+                    "{},{}",
+                    x as f32 + (n_w as f32 / 2.),
+                    y as f32 + (n_h as f32 / 2.)
+                );
             }
         }
     }
@@ -177,7 +180,13 @@ fn main() {
     eprintln!("{n_hits} hits");
 }
 
-fn load_into(out: &mut [f32], src: &[f32], (src_w, _src_h): (usize, usize), needle_size: Vector2I, (x, y): (usize, usize)) {
+fn load_into(
+    out: &mut [f32],
+    src: &[f32],
+    (src_w, _src_h): (usize, usize),
+    needle_size: Vector2I,
+    (x, y): (usize, usize),
+) {
     let mut i = 0;
     for dy in 0..(needle_size.y() as usize) {
         for dx in 0..(needle_size.x() as usize) {

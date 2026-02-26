@@ -7,12 +7,18 @@ edition = "2024"
 clap = { version = "4.5.57", features = ["derive"] }
 font-kit = { version = "0.14.3", features = ["freetype"] }
 image = {version = "0.25.9", default-features=false, features=["rayon", "pnm", "png"] }
+ndarray = "0.17.2"
 pathfinder_geometry = "0.5.1"
+petal-neighbors = "0.18.0"
 rayon = "1.11.0"
 
 [[bin]]
 name = "brute"
 path = "src/brute.rs"
+
+[[bin]]
+name = "knn"
+path = "src/knn.rs"
 
 [profile.release]
 debug = "line-tables-only"
