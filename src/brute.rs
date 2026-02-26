@@ -6,13 +6,14 @@ use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{DynamicImage, GrayImage, Luma, imageops};
+use image::{GrayImage, imageops};
 use pathfinder_geometry::rect::{RectF, RectI};
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
 
 const DEFAULT_ALPHABET: &str =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=+(){};:";
+    //"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=+(){};:";
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 #[derive(Clone, Copy)]
 enum BoxSize {
@@ -32,13 +33,6 @@ impl TryFrom<&str> for BoxSize {
         }
     }
 }
-//
-//#[derive(Clone, Copy)]
-//enum Baseline {
-//    AlphabetAscentCeil,
-//    FontAscentCeil,
-//    LetterAscentCeil,
-//}
 
 #[derive(Clone, Copy)]
 struct RenderOptions {
@@ -48,10 +42,17 @@ struct RenderOptions {
     size: f32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Match {
     rect: RectI,
     mse: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MatchWithBaseline {
+    rect: RectI,
+    mse: f32,
+    baseline: f32,
 }
 
 struct Searcher {
@@ -59,7 +60,8 @@ struct Searcher {
     reference_rot: Box<[i16]>,
     r_w: usize,
     r_h: usize,
-    acc: Vec<f32>,
+    acc: Vec<u32>,
+    is_white: Vec<u32>,
     needle: Vec<i16>,
     matches: Vec<Match>,
 }
@@ -78,7 +80,8 @@ fn render(
     let glyph_id = font.glyph_for_char(char).unwrap();
     let pos = Vector2F::new(offset[0], offset[1]);
 
-    let raster_bounds = font.raster_bounds(
+    let raster_bounds = font
+        .raster_bounds(
             glyph_id,
             render_options.size,
             Transform2F::from_translation(pos),
@@ -87,15 +90,14 @@ fn render(
         )
         .unwrap();
 
-    let size = canvas_size.unwrap_or_else(|| {
-        raster_bounds.size()
-    }) + padding * 2;
+    let size = canvas_size.unwrap_or_else(|| raster_bounds.size()) + padding * 2;
 
-    let origin = if canvas_size.is_some() { // BoxSize::Font | Alphabet
+    let origin = if canvas_size.is_some() {
+        // BoxSize::Font | Alphabet
         Vector2F::new(0., 0.)
     } else {
         //let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * to_px;
-    //let bearing_x = glyph_bounds.origin().x();
+        //let bearing_x = glyph_bounds.origin().x();
         //let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
         //bearing_y.ceil()
         -raster_bounds.origin().to_f32()
@@ -113,8 +115,9 @@ fn render(
         &mut canvas,
         glyph_id,
         render_options.size,
-        Transform2F::from_translation(origin).translate(padding.to_f32()).translate(pos),
-        //Transform2F::from_translation(Vector2F::new(bearing_x.floor(), ascent_px.ceil())).translate(pos),
+        Transform2F::from_translation(origin)
+            .translate(padding.to_f32())
+            .translate(pos),
         render_options.hinting,
         render_options.rasterization,
     )
@@ -199,10 +202,7 @@ fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
     assert!(canvas.format == Format::A8);
     let w = canvas.size.x() as u32;
     let h = canvas.size.y() as u32;
-    let mut pixels = canvas.pixels.clone();
-    for px in pixels.iter_mut() {
-        *px = 255 - *px;
-    }
+    let pixels = canvas.pixels.clone();
     GrayImage::from_raw(w, h, pixels).unwrap()
 }
 
@@ -217,18 +217,7 @@ fn get_row(arr: &[i16], w: usize, y: usize) -> &[i16] {
 }
 
 fn get_mask_n<const N: usize>(n: usize) -> [i16; N] {
-    //const MASKS: [[i16; 8]; 8] = [
-    //    [1, 0, 0, 0, 0, 0, 0, 0],
-    //    [1, 1, 0, 0, 0, 0, 0, 0],
-    //    [1, 1, 1, 0, 0, 0, 0, 0],
-    //    [1, 1, 1, 1, 0, 0, 0, 0],
-    //    [1, 1, 1, 1, 1, 0, 0, 0],
-    //    [1, 1, 1, 1, 1, 1, 0, 0],
-    //    [1, 1, 1, 1, 1, 1, 1, 0],
-    //    [1, 1, 1, 1, 1, 1, 1, 1],
-    //];
     assert!(n >= 1 && n <= N);
-    //MASKS[n - 1]
     let mut arr = [0i16; N];
     for i in 0..n {
         arr[i] = 1;
@@ -249,7 +238,8 @@ impl Searcher {
         let r_w = img.width() as usize;
         let r_h = img.height() as usize;
         let matches = Vec::with_capacity(1024);
-        let acc = vec![0f32; img.width() as usize];
+        let acc = vec![0; img.width() as usize];
+        let is_white = vec![0; img.width() as usize];
         let needle = vec![0; 1024];
 
         Searcher {
@@ -259,6 +249,7 @@ impl Searcher {
             r_h,
             needle,
             acc,
+            is_white,
             matches,
         }
     }
@@ -267,22 +258,34 @@ impl Searcher {
     fn search(&mut self, needle: &GrayImage, threshold: f32) -> (f32, &[Match]) {
         let w = needle.width();
         let h = needle.height();
-        if w > 16 || h > 16 {
-            self.search_var(needle, threshold)
-        } else if w >= h {
-            if w <= 8 {
-                self.search_n::<8>(needle, threshold, false)
+        let use_rot = false;
+        if use_rot {
+            if w > 16 || h > 16 {
+                self.search_var(needle, threshold)
+            } else if w >= h {
+                if w <= 8 {
+                    self.search_n::<8>(needle, threshold, false)
+                } else {
+                    // TODO this isn't generating avx2 for some reason
+                    self.search_n::<16>(needle, threshold, false)
+                }
             } else {
-                // TODO this isn't generating avx2 for some reason
-                self.search_n::<16>(needle, threshold, false)
+                let needle_rot = rotate(needle);
+                if h <= 8 {
+                    self.search_n::<8>(&needle_rot, threshold, true)
+                } else {
+                    assert!(h <= 16);
+                    self.search_n::<16>(&needle_rot, threshold, true)
+                }
             }
         } else {
-            let needle_rot = rotate(needle);
-            if h <= 8 {
-                self.search_n::<8>(&needle_rot, threshold, true)
+            if w <= 8 {
+                self.search_n::<8>(needle, threshold, false)
+            } else if w <= 16 {
+                // TODO this isn't generating avx2 for some reason
+                self.search_n::<16>(needle, threshold, false)
             } else {
-                assert!(h <= 16);
-                self.search_n::<16>(&needle_rot, threshold, true)
+                self.search_var(needle, threshold)
             }
         }
     }
@@ -297,8 +300,8 @@ impl Searcher {
         let x_searches = self.r_w - n_w + 1;
         let y_searches = self.r_h - n_h + 1;
 
-        self.acc.fill(0.);
-        self.acc.resize(x_searches, 0.);
+        self.acc.fill(0);
+        self.acc.resize(x_searches, 0);
 
         let divisor = (needle.width() as f32) * (needle.height() as f32);
         let mut min = f32::MAX;
@@ -316,7 +319,7 @@ impl Searcher {
                             .reference
                             .get((y + needle_y) * self.r_w + needle_x + x)
                             .unwrap();
-                        *acc += ((*npx as i16 - *rpx) as i32).pow(2) as f32;
+                        *acc += ((*npx as i16 - *rpx) as i32).pow(2) as u32;
                     }
                 }
             }
@@ -329,7 +332,7 @@ impl Searcher {
                     self.matches.push(Match { mse, rect });
                 }
             }
-            self.acc.fill(0.);
+            self.acc.fill(0);
         }
         (min, &self.matches)
     }
@@ -362,8 +365,11 @@ impl Searcher {
             &self.reference
         };
 
-        self.acc.fill(0.);
-        self.acc.resize(x_searches, 0.);
+        self.acc.fill(0);
+        self.acc.resize(x_searches, 0);
+
+        self.is_white.fill(0);
+        self.is_white.resize(x_searches, 0);
 
         let divisor = (N as f32) * (n_h as f32);
         //let scaled_threshold = (divisor * threshold).ceil();
@@ -383,17 +389,18 @@ impl Searcher {
         for y in 0..y_searches {
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
                 let ref_windows = get_row(&reference, r_w, y + needle_y).array_windows::<N>();
-                for (acc, ref_row) in self.acc.iter_mut().zip(ref_windows) {
+                for ((acc, is_white), ref_row) in self.acc.iter_mut().zip(self.is_white.iter_mut()).zip(ref_windows) {
                     // trying early termination, but not that helpful
                     //if *acc < scaled_threshold {
-                    *acc += sqerror_n(*needle_row, *ref_row, mask) as f32;
+                    *acc += sqerror_n(*needle_row, *ref_row, mask);
+                    *is_white += ref_row.iter().map(|x| *x as u32).sum::<u32>();
                     //}
                 }
             }
-            for (x, acc) in self.acc.iter().enumerate() {
+            for (x, (acc, is_white)) in self.acc.iter().zip(self.is_white.iter()).enumerate() {
                 let mse = *acc as f32 / divisor;
                 min = f32::min(mse, min);
-                if mse < threshold {
+                if mse < threshold && *is_white > 0 {
                     let rect = if rot {
                         RectI::new(
                             Vector2I::new((r_h - y - n_h) as i32, x as i32),
@@ -408,7 +415,8 @@ impl Searcher {
                     self.matches.push(Match { mse, rect });
                 }
             }
-            self.acc.fill(0.);
+            self.acc.fill(0);
+            self.is_white.fill(0);
         }
         //eprintln!("got min of {min}");
         (min, &self.matches)
@@ -476,8 +484,11 @@ struct Args {
     #[arg(short, long)]
     text_size: f32,
 
-    #[arg(short, long, default_value_t = 0)]
-    bits: u32,
+    #[arg(long, default_value_t = 0)]
+    x_bits: u32,
+
+    #[arg(long, default_value_t = 0)]
+    y_bits: u32,
 
     #[arg(long)]
     hinting: bool,
@@ -491,10 +502,10 @@ struct Args {
     #[arg(long, default_value = "char")]
     box_size: String,
 
-    #[arg(long, default_value_t=0)]
+    #[arg(long, default_value_t = 0)]
     padding_x: usize,
 
-    #[arg(long, default_value_t=0)]
+    #[arg(long, default_value_t = 0)]
     padding_y: usize,
 }
 
@@ -517,41 +528,20 @@ fn main() {
     };
     let box_size = args.box_size.as_str().try_into().unwrap();
 
-    //let offsets = [
-    //    [0.0, 0.0],
-    //    //[0.5, 0.0],
-    //    //[0.0, 0.5],
-    //    //[0.5, 0.5],
-    //    [0.25, 0.0],
-    //    //[0.0, 0.25],
-    //    //[0.25, 0.25],
-    //    //
-    //    [0.125, 0.0],
-    //    //[0.0, 0.125],
-    //    //[0.125, 0.125],
-    //    //
-    //    //[0.1, 0.0],
-    //    //[0.0, 0.1],
-    //    //[0.1, 0.1],
-    //
-    //    //[-0.5, -0.0],
-    //    //[0.0, -0.5],
-    //    //[-0.5, -0.5],
-    //    //[-0.25, 0.0],
-    //    //[-0.0, -0.25],
-    //    //[-0.25, -0.25],
-    //];
     let offsets = {
         let mut acc = vec![];
-        let divisor = 1. / 2usize.pow(args.bits) as f32;
-        for x in 0..2usize.pow(args.bits) {
-            for y in 0..2usize.pow(args.bits) {
-                acc.push([x as f32 * divisor, y as f32 * divisor]);
+        let x_divisor = 1. / 2usize.pow(args.x_bits) as f32;
+        let y_divisor = 1. / 2usize.pow(args.y_bits) as f32;
+        for x in 0..2usize.pow(args.x_bits) {
+            for y in 0..2usize.pow(args.y_bits) {
+                acc.push([x as f32 * x_divisor, y as f32 * y_divisor]);
             }
         }
         acc
     };
+
     let font = Font::from_path(args.font, 0).unwrap();
+
     if true {
         let metrics = font.metrics();
         let to_px = (1. / metrics.units_per_em as f32) * args.text_size;
@@ -595,39 +585,11 @@ fn main() {
     let mut total_mse = 0.;
     let mut n_hits = 0;
 
-    // this shows all offset are unique
-    //if false {
-    //    println!("({offsets:#?})");
-    //
-    //    for letter in args.alphabet.chars() {
-    //        let mut set = std::collections::HashSet::new();
-    //        for offset in &offsets {
-    //            let canvas = render(&font, letter, *offset, render_options, None);
-    //            set.insert(canvas.pixels);
-    //        }
-    //        println!("`{letter}` {}/{}", set.len(), offsets.len());
-    //    }
-    //    return;
-    //}
-    //
-    //if false {
-    //    let mut s = String::new();
-    //    for c1 in args.alphabet.chars() {
-    //        for c2 in args.alphabet.chars() {
-    //            s.push(c1);
-    //            s.push(c2);
-    //            let canvas = render_string(&font, &s, [0., 0.], render_options, None);
-    //            s.clear();
-    //        }
-    //    }
-    //    return;
-    //}
-    //
-
     let to_px = (1. / font.metrics().units_per_em as f32) * render_options.size;
 
     let t00 = Instant::now();
 
+    let mut all_hits = Vec::with_capacity(4096);
     let mut canvas_cache = None;
     for offset in &offsets {
         let (y_offset, canvas_size) = match box_size {
@@ -686,7 +648,7 @@ fn main() {
             //if true {
             //    let x = (offset[0] * 1000.) as usize;
             //    let y = (offset[1] * 1000.) as usize;
-            //    DynamicImage::ImageLuma8(needle.clone()).save(format!("letters/{letter}-{x}_{y}.png")).unwrap();
+            //    image::DynamicImage::ImageLuma8(needle.clone()).save(format!("letters/{letter}-{x}_{y}.png")).unwrap();
             //}
             let t0 = Instant::now();
             let (min, hits) = searcher.search(&needle, args.threshold);
@@ -704,19 +666,21 @@ fn main() {
             let glyph_id = font.glyph_for_char(letter).unwrap();
             let units_per_em = font.metrics().units_per_em as f32;
             let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * to_px;
-            let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
+            let _bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
             let bearing_x = glyph_bounds.origin().x();
-            let ascent_px = font.metrics().ascent * (1. / units_per_em) * render_options.size;
+            let _ascent_px = font.metrics().ascent * (1. / units_per_em) * render_options.size;
             let mut last_rect = RectI::default();
             for hit in hits {
                 if hit.rect.intersects(last_rect) {
-                    //eprintln!("skipping");
                     continue;
                 }
+                all_hits.push(MatchWithBaseline {
+                    mse: hit.mse,
+                    rect: hit.rect,
+                    baseline: corrected_offset[1],
+                });
                 last_rect = hit.rect;
                 total_mse += hit.mse;
-                //println!("{hit:?}");
-                //println!("{},{}", hit.x + offset[0], hit.y + offset[1]);
                 let ul = hit.rect.origin();
                 let pt = hit.rect.to_f32().center();
                 println!(
@@ -728,22 +692,10 @@ fn main() {
                     hit.rect.width(),
                     hit.rect.height(),
                     bearing_x,
-                    ascent_px,
-                    //bearing_y,
+                    corrected_offset[1],
                     offset[0],
                     offset[1],
                 );
-                //for offset in [1., -1.] {
-                //    println!(
-                //        "{},{},{},{},{},{}",
-                //        pt.x(),
-                //        pt.y() + line_space_px,
-                //        ul.x(),
-                //        ul.y() as f32 + offset * line_space_px.floor(),
-                //        hit.rect.width(),
-                //        hit.rect.height()
-                //    );
-                //}
                 //eprintln!("HIT {},{} offset {:?}", pt.x(), pt.y(), offset);
             }
             //eprintln!("took {:.4}ms", (t1 - t0).as_millis());
@@ -753,10 +705,39 @@ fn main() {
     eprintln!("overall {:.4}ms", (t11 - t00).as_millis());
     let avg_mse = total_mse / n_hits as f32;
     eprintln!("hits: {n_hits} mse per hit:{avg_mse}");
+
+    let baselines = {
+        let mut tmp: Vec<_> = all_hits.iter().map(|h| h.rect.lower_left().y() as f32 + h.baseline).collect();
+        tmp.sort_by(f32::total_cmp);
+        tmp.dedup();
+        tmp
+    };
+    let baseline_diff_counts = {
+        let mut counts = std::collections::HashMap::new();
+        for [b1, b2] in baselines.array_windows::<2>() {
+            let diff = b2 - b1;
+            let key = format!("{diff}");
+            //eprintln!("{diff}");
+            if let Some(count) = counts.get_mut(&key) {
+                *count += 1;
+            } else {
+                counts.insert(key, 1);
+            }
+        }
+        let mut counts: Vec<_> = counts.into_iter().map(|(diff, count)| (count, diff)).collect();
+        counts.sort();
+        counts
+    };
+    for (count, diff) in baseline_diff_counts {
+        eprintln!("{diff} {count}");
+    }
+    // so we jump between 12 and 13 pixels between baselines
+    // so either the text is getting snapped
+    // or the true line spacing is somewhere between
 }
 
 fn image_to_i16(img: &GrayImage) -> Vec<i16> {
-    img.as_raw().iter().map(|x| *x as i16).collect()
+    img.as_raw().iter().map(|x| (255 - x) as i16).collect()
 }
 
 fn sqerror_n<const N: usize>(a: [i16; N], b: [i16; N], mask: [i16; N]) -> u32 {
