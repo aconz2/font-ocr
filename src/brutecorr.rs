@@ -46,28 +46,27 @@ struct RenderOptions {
 #[derive(Clone, Copy, Debug)]
 struct Match {
     rect: RectI,
-    error: AccType,
+    similarity: AccType,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct MatchWithBaseline {
     rect: RectI,
-    error: AccType,
+    similarity: AccType,
     baseline: f32,
 }
 
 // seeing a large speedup using u32 over u64 for accumulating the sum of squared errors
 // and as the threshold type
 // the max total error we can get is W*H*255^2, for up to say 16x16, that fits in 24 bits
-type AccType = u32;
+type AccType = f32;
 
 struct Searcher {
-    reference: Box<[i16]>,
-    reference_rot: Box<[i16]>,
+    reference: Box<[f32]>,
     r_w: usize,
     r_h: usize,
     acc: Vec<AccType>,
-    needle: Vec<i16>,
+    needle: Vec<f32>,
     matches: Vec<Match>,
 }
 
@@ -211,47 +210,42 @@ fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
     GrayImage::from_raw(w, h, pixels).unwrap()
 }
 
-fn copy_needle_n<const N: usize>(out: &mut [[i16; N]], lum8: &[u8], size: Vector2I) {
+fn copy_needle_n<const N: usize>(out: &mut [[f32; N]], needle: &[f32], size: Vector2I) {
     let w = size.x() as usize;
     for y in 0..(size.y() as usize) {
         for x in 0..(size.x() as usize) {
-            out[y][x] = lum8[y * w + x] as i16;
+            out[y][x] = needle[y * w + x];
         }
     }
 }
 
-fn get_row(arr: &[i16], w: usize, y: usize) -> &[i16] {
+fn get_row<T>(arr: &[T], w: usize, y: usize) -> &[T] {
     &arr[y * w..(y + 1) * w]
 }
 
-fn get_mask_n<const N: usize>(n: usize) -> [i16; N] {
+fn get_mask_n<const N: usize>(n: usize) -> [f32; N] {
     assert!(n >= 1 && n <= N);
-    let mut arr = [0i16; N];
+    let mut arr = [0f32; N];
     for i in 0..n {
-        arr[i] = 1;
+        arr[i] = 1.;
     }
     arr
 }
 
-fn rotate(img: &GrayImage) -> GrayImage {
-    let mut ret = GrayImage::new(img.height(), img.width());
-    imageops::rotate270_in(img, &mut ret).unwrap();
-    ret
-}
-
 impl Searcher {
     fn new(img: &GrayImage) -> Searcher {
-        let reference = image_to_i16(img);
-        let reference_rot = image_to_i16(&rotate(img));
+        let mut reference = image_to_f32(img);
+        normalize_image(&mut reference);
+
+        let norm = reference.iter().fold(0f64, |acc, x| acc + (*x as f64) * (*x as f64)).sqrt();
         let r_w = img.width() as usize;
         let r_h = img.height() as usize;
         let matches = Vec::with_capacity(1024);
-        let acc = vec![0; img.width() as usize];
-        let needle = vec![0; 1024];
+        let acc = vec![0.; img.width() as usize];
+        let needle = vec![0.; 1024];
 
         Searcher {
             reference: reference.into(),
-            reference_rot: reference_rot.into(),
             r_w,
             r_h,
             needle,
@@ -260,220 +254,75 @@ impl Searcher {
         }
     }
 
-    // rotating is marginally faster 3% ish so maybe not worthwhile
-    fn search(&mut self, lum8: &[u8], size: Vector2I, threshold: AccType) -> (AccType, &[Match]) {
+    fn search(&mut self, needle: &[f32], size: Vector2I, threshold: AccType) -> &[Match] {
         let w = size.x();
-        //let w = needle.width();
-        //let h = needle.height();
-        let use_rot = false;
-        //if use_rot {
-        //    if w > 16 || h > 16 {
-        //        self.search_var(needle, threshold)
-        //    } else if w >= h {
-        //        if w <= 8 {
-        //            self.search_n::<8>(needle, threshold, false)
-        //        } else {
-        //            // TODO this isn't generating avx2 for some reason
-        //            self.search_n::<16>(needle, threshold, false)
-        //        }
-        //    } else {
-        //        let needle_rot = rotate(needle);
-        //        if h <= 8 {
-        //            self.search_n::<8>(&needle_rot, threshold, true)
-        //        } else {
-        //            assert!(h <= 16);
-        //            self.search_n::<16>(&needle_rot, threshold, true)
-        //        }
-        //    }
-        //} else {
         if w <= 8 {
-            self.search_n::<8>(lum8, size, threshold, false)
+            self.search_n::<8>(needle, size, threshold)
         } else if w <= 16 {
             // TODO this isn't generating avx2 for some reason
-            self.search_n::<16>(lum8, size, threshold, false)
+            self.search_n::<16>(needle, size, threshold)
         } else {
-            self.search_var(lum8, size, threshold)
+            todo!()
         }
-        //}
-    }
-
-    #[inline(never)]
-    fn search_var(
-        &mut self,
-        lum8: &[u8],
-        size: Vector2I,
-        threshold: AccType,
-    ) -> (AccType, &[Match]) {
-        self.matches.clear();
-
-        let n_h = size.y() as usize;
-        let n_w = size.x() as usize;
-
-        let x_searches = self.r_w - n_w + 1;
-        let y_searches = self.r_h - n_h + 1;
-
-        self.acc.fill(0);
-        self.acc.resize(x_searches, 0);
-
-        let mut min = AccType::MAX;
-
-        for y in 0..y_searches {
-            for needle_y in 0..n_h {
-                for (x, acc) in self.acc.iter_mut().enumerate() {
-                    for needle_x in 0..n_w {
-                        //let npx = unsafe { needle_raw.get_unchecked(needle_y * n_w + needle_x) };
-                        //let rpx = unsafe { self.reference.get_unchecked((y + needle_y) * self.r_w + needle_x + x) };
-                        let npx = lum8.get(needle_y * n_w + needle_x).unwrap();
-                        let rpx = self
-                            .reference
-                            .get((y + needle_y) * self.r_w + needle_x + x)
-                            .unwrap();
-                        *acc += ((*npx as i16 - *rpx) as i32).pow(2) as AccType;
-                    }
-                }
-            }
-            for (x, acc) in self.acc.iter().enumerate() {
-                let error = *acc;
-                min = AccType::min(error, min);
-                if error < threshold {
-                    let upper_left = Vector2I::new(x as i32, y as i32);
-                    let rect = RectI::new(upper_left, Vector2I::new(n_w as i32, n_h as i32));
-                    self.matches.push(Match { error, rect });
-                }
-            }
-            self.acc.fill(0);
-        }
-        (min, &self.matches)
     }
 
     #[inline(never)]
     fn search_n<const N: usize>(
         &mut self,
-        lum8: &[u8],
+        needle: &[f32],
         size: Vector2I,
         threshold: AccType,
-        rot: bool,
-    ) -> (AccType, &[Match]) {
+    ) -> &[Match] {
         assert!(size.x() <= N as i32);
         self.matches.clear();
 
         let n_h = size.y() as usize;
         let n_w = size.x() as usize;
 
-        let (r_w, r_h) = if rot {
-            (self.r_h, self.r_w)
-        } else {
-            (self.r_w, self.r_h)
-        };
+        let (r_w, r_h) = (self.r_w, self.r_h);
 
         let x_searches = r_w - N + 1;
         let y_searches = r_h - n_h + 1;
 
-        let reference = if rot {
-            &self.reference_rot
-        } else {
-            &self.reference
-        };
+        let mut min_sim = 1.;
+        let mut max_sim = -1.;
+        let divisor = 1. / (n_w as f32 * n_h as f32);
 
-        self.acc.fill(0);
-        self.acc.resize(x_searches, 0);
+        self.acc.fill(0.);
+        self.acc.resize(x_searches, 0.);
 
-        //let scaled_threshold = (divisor * threshold).ceil();
-        let mut min = AccType::MAX;
-
-        //self.needle.fill([255i16; 8]);
-        self.needle.resize(N * n_h as usize, 0);
+        self.needle.resize(N * n_h as usize, 0.);
         {
             let (rows, _rem) = self.needle.as_chunks_mut::<N>();
-            copy_needle_n(rows, lum8, size);
+            copy_needle_n(rows, needle, size);
         }
-        //let mut needle_buf = vec![[255i16; N]; n_h];
-        //copy_needle_n(&mut needle_buf, needle);
         let mask = get_mask_n(n_w);
         let (needle_buf, _rem) = self.needle.as_chunks::<N>();
 
         for y in 0..y_searches {
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
-                let ref_windows = get_row(&reference, r_w, y + needle_y).array_windows::<N>();
+                let ref_windows = get_row(&self.reference, r_w, y + needle_y).array_windows::<N>();
                 for (acc, ref_row) in self.acc.iter_mut().zip(ref_windows) {
-                    // trying early termination, but not that helpful
-                    //if *acc < scaled_threshold {
-                    *acc += sqerror_n(*needle_row, *ref_row, mask) as AccType;
-                    //}
+                    *acc += cross_corr_n(*needle_row, *ref_row, mask) as AccType;
                 }
             }
             for (x, acc) in self.acc.iter().enumerate() {
-                let error = *acc;
-                min = AccType::min(error, min);
-                if error < threshold {
-                    let rect = if rot {
-                        RectI::new(
-                            Vector2I::new((r_h - y - n_h) as i32, x as i32),
-                            Vector2I::new(n_h as i32, n_w as i32),
-                        )
-                    } else {
-                        RectI::new(
+                let similarity = *acc * divisor;
+                max_sim = f32::max(max_sim, similarity);
+                min_sim = f32::min(max_sim, similarity);
+                if similarity > threshold {
+                    let rect = RectI::new(
                             Vector2I::new(x as i32, y as i32),
                             Vector2I::new(n_w as i32, n_h as i32),
-                        )
-                    };
-                    self.matches.push(Match { error, rect });
+                        );
+                    self.matches.push(Match { similarity, rect });
                 }
             }
-            self.acc.fill(0);
+            self.acc.fill(0.);
         }
-        //eprintln!("got min of {min}");
-        (min, &self.matches)
+        eprintln!("max sim {max_sim} min sim {min_sim}");
+        &self.matches
     }
-    //#[inline(never)]
-    //fn search8x2(&mut self, needle: &GrayImage, threshold: f32) -> (f32, &[Match]) {
-    //    assert!(needle.width() <= 8);
-    //    self.matches.clear();
-    //
-    //    let n_h = needle.height() as usize;
-    //    let n_w = needle.width() as usize;
-    //
-    //    let x_searches = self.r_w - 8 + 1;
-    //    let y_searches = self.r_h - n_h + 1;
-    //
-    //    self.acc.fill(0.);
-    //    self.acc.resize(x_searches, 0.);
-    //
-    //    let divisor = 8. * (n_h as f32);
-    //    let mut min = f32::MAX;
-    //
-    //    self.needlex2.fill([255i16; 16]);
-    //    self.needlex2.resize(n_h as usize, [255i16; 16]);
-    //    copy_needle8x2(&mut self.needlex2, needle);
-    //
-    //    let (acc_chunks, rem) = self.acc.as_chunks_mut::<2>();
-    //    if rem.is_empty() {
-    //        eprintln!("WARN x2 rem not empty");
-    //    }
-    //
-    //    for y in 0..y_searches {
-    //        for (needle_y, needle_row) in self.needlex2.iter().enumerate() {
-    //            let ref_windows = get_row(&self.reference, self.r_w, y + needle_y).array_windows::<16>().array_chunks::<8>().step_by(2);
-    //            for ((_x, acc), ref_row) in acc_chunks.iter_mut().enumerate().zip(ref_windows) {
-    //                let (a0, a1) = se_i168x2(*needle_row, *ref_row);
-    //                acc[0] += a0;
-    //                acc[1] += a1;
-    //            }
-    //        }
-    //        for (x, acc) in acc_chunks.as_flattened().iter().enumerate() {
-    //            let mse = *acc as f32 / divisor;
-    //            min = f32::min(mse, min);
-    //            if mse < threshold {
-    //                let upper_left = Vector2F::new(x as f32, y as f32);
-    //                let rect = RectF::new(upper_left, Vector2F::new(n_w as f32, n_h as f32));
-    //                self.matches.push(Match{mse, rect});
-    //            }
-    //        }
-    //        acc_chunks.fill([0., 0.]);
-    //    }
-    //    //eprintln!("got min of {min}");
-    //    (min, &self.matches)
-    //}
 }
 
 #[derive(Parser, Debug)]
@@ -500,11 +349,8 @@ struct Args {
     // this threshold value is the non-squared distance in pixels for each letter, excluding
     // background pixels. this keeps a `-` from matching whitespace because otherwise the large
     // majority of white matching brings the mean or sqrt/euclidean distance so low
-    #[arg(long, default_value_t = 50)]
-    threshold: usize,
-
-    #[arg(long, default_value_t = 0.9)]
-    correlation_percent: f32,
+    #[arg(long, default_value_t = 0.95)]
+    threshold: f32,
 
     #[arg(short, long, default_value_t=DEFAULT_ALPHABET.to_string())]
     alphabet: String,
@@ -529,10 +375,6 @@ fn main() {
     let args = Args::parse();
 
     let padding = Vector2I::new(args.padding_x as i32, args.padding_y as i32);
-
-    if args.correlation_percent < 0. || args.correlation_percent > 1. {
-        panic!("need correlation-percent as [0-1]");
-    }
 
     let hinting = if args.hinting {
         HintingOptions::Full(args.text_size)
@@ -602,7 +444,7 @@ fn main() {
     }
     let img = image::open(args.img.first().unwrap()).unwrap().into_luma8();
     let mut searcher = Searcher::new(&img);
-    let mut total_error = 0;
+    //let mut total_error = 0;
     let mut n_hits = 0;
 
     let to_px = (1. / font.metrics().units_per_em as f32) * render_options.size;
@@ -659,6 +501,7 @@ fn main() {
         };
         let corrected_offset = [offset[0], offset[1] + y_offset];
         for letter in args.alphabet.chars() {
+            let t0 = Instant::now();
             let canvas = render(
                 &font,
                 letter,
@@ -668,11 +511,10 @@ fn main() {
                 canvas_cache.take(),
                 padding,
             );
-            //let needle = canvas_to_lum8(&canvas);
+            let mut needle = canvas_to_f32(&canvas);
+            normalize_image(&mut needle);
             // canvas has black as background, count # of pixels which actually have some letter in
             // them
-            //let threshold = canvas.pixels.iter().filter(|x| x > &&0).count() * args.threshold.pow(2);
-            let threshold = canvas.pixels.iter().map(|x| ((*x / 2) as u16).pow(2) as u32).sum::<u32>() as f32 * args.correlation_percent;
             let size = canvas.size;
             if args.count_unique {
                 total_rows += size.y() as usize;
@@ -688,16 +530,13 @@ fn main() {
                 let im = canvas_to_lum8(&canvas);
                 image::DynamicImage::ImageLuma8(im).save(format!("letters/{letter}-{x}_{y}.png")).unwrap();
             }
-            let t0 = Instant::now();
-            let (min, hits) = searcher.search(&canvas.pixels, canvas.size, threshold as AccType);
+            let hits = searcher.search(&needle, canvas.size, args.threshold);
             let t1 = Instant::now();
             let _ = canvas_cache.insert(canvas);
             eprintln!(
-                "`{letter}` {offset:?} needle size {}x{} min error {} threshold {} hits {} elapsed {}ms",
+                "`{letter}` {offset:?} needle size {}x{} hits {} elapsed {}ms",
                 size.x(),
                 size.y(),
-                min,
-                threshold,
                 hits.len(),
                 (t1 - t0).as_millis()
             );
@@ -714,13 +553,18 @@ fn main() {
                 if hit.rect.intersects(last_rect) {
                     continue;
                 }
+                if let Some(entry) = hits_by_char.get_mut(&letter) {
+                    *entry += 1;
+                } else {
+                    assert!(false);
+                };
                 all_hits.push(MatchWithBaseline {
-                    error: hit.error,
+                    similarity: hit.similarity,
                     rect: hit.rect,
                     baseline: corrected_offset[1],
                 });
                 last_rect = hit.rect;
-                total_error += hit.error;
+                //total_error += hit.error;
                 let ul = hit.rect.origin();
                 let pt = hit.rect.to_f32().center();
                 println!(
@@ -751,8 +595,9 @@ fn main() {
             unique_rows.len() as f32 / total_rows as f32 * 100.
         );
     }
-    let avg_error = total_error as f32 / n_hits as f32;
-    eprintln!("hits: {n_hits} error per hit:{avg_error}");
+    //let avg_error = total_error as f32 / n_hits as f32;
+    //eprintln!("hits: {n_hits} error per hit:{avg_error}");
+    eprintln!("hits: {n_hits}");
 
     for (char, count) in hits_by_char {
         eprintln!("`{char}` {count}");
@@ -796,14 +641,29 @@ fn main() {
     }
 }
 
-fn image_to_i16(img: &GrayImage) -> Vec<i16> {
-    img.as_raw().iter().map(|x| (255 - x) as i16).collect()
+fn image_to_f32(img: &GrayImage) -> Vec<f32> {
+    img.as_raw().iter().map(|x| (255 - *x) as f32 / 255.).collect()
 }
 
-fn sqerror_n<const N: usize>(a: [i16; N], b: [i16; N], mask: [i16; N]) -> u32 {
-    let mut ret = 0u32;
+fn canvas_to_f32(canvas: &Canvas) -> Vec<f32> {
+    canvas.pixels.iter().map(|x| *x as f32 / 255.).collect()
+}
+
+// for NCC, the norm has to be of the window, which is the same for the needle each time,
+// but varies for the image
+fn normalize_image(pixels: &mut [f32]) {
+    let mean = pixels.iter().map(|x| *x as f64).sum::<f64>() / pixels.len() as f64;
+    let mean = mean as f32;
+    pixels.iter_mut().for_each(|x| *x -= mean);
+    //let norm = pixels.iter().fold(0f64, |acc, x| acc + (*x as f64) * (*x as f64)).sqrt();
+    //let norm = (1. / norm) as f32;
+    //pixels.iter_mut().for_each(|x| *x *= norm);
+}
+
+fn cross_corr_n<const N: usize>(a: [f32; N], b: [f32; N], mask: [f32; N]) -> f32 {
+    let mut ret = 0f32;
     for i in 0..N {
-        ret += (((a[i] - b[i]) * mask[i]) as i32).pow(2) as u32;
+        ret += a[i] * b[i] * mask[i];
     }
     ret
 }

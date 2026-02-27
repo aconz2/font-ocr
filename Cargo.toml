@@ -17,6 +17,10 @@ name = "brute"
 path = "src/brute.rs"
 
 [[bin]]
+name = "brutecorr"
+path = "src/brutecorr.rs"
+
+[[bin]]
 name = "knn"
 path = "src/knn.rs"
 
