@@ -7,7 +7,7 @@ use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{GrayImage, imageops};
+use image::{GrayImage};
 use pathfinder_geometry::rect::{RectF, RectI};
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
@@ -62,7 +62,9 @@ struct MatchWithBaseline {
 type AccType = f32;
 
 struct Searcher {
-    reference: Box<[f32]>,
+    reference: Array2<f32>,
+    sum_table: Array2<f32>,
+    sumsqr_table: Array2<f32>,
     r_w: usize,
     r_h: usize,
     acc: Vec<AccType>,
@@ -129,78 +131,40 @@ fn render(
     canvas
 }
 
-//fn render_string(
-//    font: &Font,
-//    text: &str,
-//    offset: [f32; 2],
-//    render_options: RenderOptions,
-//    canvas: Option<Canvas>,
-//) -> Canvas {
-//    assert!(render_options.format == Format::A8);
-//    let units_per_em = font.metrics().units_per_em as f32;
-//
-//    let mut glyph_pos = Vec::with_capacity(text.len());
-//
-//    let mut pos = Vector2F::new(offset[0], offset[1]);
-//
-//    for char in text.chars() {
-//        let glyph_id = font.glyph_for_char(char).unwrap();
-//        glyph_pos.push((glyph_id, pos));
-//        pos += font.advance(glyph_id).unwrap() / units_per_em * render_options.size;
-//        let bounds = font.typographic_bounds(glyph_id).unwrap() * (1. / units_per_em) * render_options.size;
-//        let bounds2 = font.typographic_bounds(glyph_id).unwrap();
-//        eprintln!("{char} {bounds:?} {bounds2:?}");
-//    }
-//
-//    let bounds = glyph_pos
-//        .iter()
-//        .fold(RectF::default(), |bounds, (glyph_id, pos)| {
-//            let raster_rect = font
-//                .raster_bounds(
-//                    *glyph_id,
-//                    render_options.size,
-//                    Transform2F::from_translation(*pos),
-//                    render_options.hinting,
-//                    render_options.rasterization,
-//                )
-//                .unwrap();
-//            eprintln!("raster rect {raster_rect:?}");
-//            bounds.union_rect(raster_rect.to_f32())
-//        });
-//
-//    eprintln!("bounds `{}` {:?}", text, bounds);
-//    let font_bbox = font.metrics().bounding_box * (1. / units_per_em) * render_options.size;
-//    eprintln!("font_bbox {:?} height={}", font_bbox, font_bbox.height());
-//
-//    let size = Vector2I::new(
-//        bounds.width().ceil() as i32,
-//        //font_bbox.height().ceil() as i32,
-//        font_bbox.height().ceil() as i32,
-//        //bounds.height().ceil() as i32,
-//    );
-//
-//    let mut canvas = match canvas {
-//        Some(canvas) if canvas.size == size => { canvas },
-//        _ => Canvas::new(size, render_options.format),
-//    };
-//
-//    for (glyph_id, pos) in glyph_pos {
-//        let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * (1. / units_per_em) * render_options.size;
-//        let bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
-//        eprintln!("bearing_y {bearing_y}");
-//        //eprintln!("pos={:?}", pos);
-//        font.rasterize_glyph(
-//            &mut canvas,
-//            glyph_id,
-//            render_options.size,
-//            Transform2F::from_translation(-bounds.origin()).translate(pos),
-//            render_options.hinting,
-//            render_options.rasterization,
-//        )
-//        .unwrap();
-//    }
-//    canvas
-//}
+#[derive(Clone)]
+struct Array2<T: Copy> {
+    data: Box<[T]>,
+    rows: usize,
+    cols: usize,
+}
+
+impl<T: Copy> std::ops::Index<(usize, usize)> for Array2<T> {
+    type Output = T;
+    fn index(&self, (x, y): (usize, usize)) -> &Self::Output {
+        &self.data[y * self.cols + x]
+    }
+}
+
+impl<T: Copy> std::ops::IndexMut<(usize, usize)> for Array2<T> {
+    fn index_mut(&mut self, (x, y): (usize, usize)) -> &mut Self::Output {
+        &mut self.data[y * self.cols + x]
+    }
+}
+
+impl<T: Copy> Array2<T> {
+    //fn len(&self) -> usize { self.data.len() }
+    fn get_row(&self, y: usize) -> &[T] {
+        &self.data[y * self.cols..(y+1) * self.cols]
+    }
+
+    fn ravel_block(&self, (x, y): (usize, usize), (w, h): (usize, usize)) -> Vec<T> {
+        let mut ret = Vec::with_capacity(w * h);
+        for row in 0..h {
+            ret.extend(&self.get_row(y + row)[x..x+w]);
+        }
+        ret
+    }
+}
 
 fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
     assert!(canvas.format == Format::A8);
@@ -219,10 +183,6 @@ fn copy_needle_n<const N: usize>(out: &mut [[f32; N]], needle: &[f32], size: Vec
     }
 }
 
-fn get_row<T>(arr: &[T], w: usize, y: usize) -> &[T] {
-    &arr[y * w..(y + 1) * w]
-}
-
 fn get_mask_n<const N: usize>(n: usize) -> [f32; N] {
     assert!(n >= 1 && n <= N);
     let mut arr = [0f32; N];
@@ -232,12 +192,67 @@ fn get_mask_n<const N: usize>(n: usize) -> [f32; N] {
     arr
 }
 
+// https://isas.iar.kit.edu/pdf/SPIE01_BriechleHanebeck_CrossCorr.pdf
+fn ncc_sum_table(pixels: &Array2<f32>) -> Array2<f32> {
+    let mut ret = pixels.clone();
+    // cloning takes care of initializing the first row and col
+    for y in 1..pixels.rows as usize {
+        for x in 1..pixels.cols as usize {
+            ret[(x, y)] = ret[(x, y)] + ret[(x - 1, y)] + ret[(x, y - 1)] - ret[(x - 1, y - 1)];
+        }
+    }
+    ret
+}
+
+fn ncc_sumsqr_table(pixels: &Array2<f32>) -> Array2<f32> {
+    let mut ret = pixels.clone();
+    for x in 0..pixels.cols {
+        ret[(x, 0)] = ret[(x, 0)] * ret[(x, 0)];
+    }
+    for y in 0..pixels.rows {
+        ret[(0, y)] = ret[(0, y)] * ret[(0, y)];
+    }
+    for y in 1..pixels.rows {
+        for x in 1..pixels.cols {
+            ret[(x, y)] = ret[(x, y)] * ret[(x, y)] + ret[(x - 1, y)] + ret[(x, y - 1)] - ret[(x - 1, y - 1)];
+            assert!(ret[(x, y)] >= 0.);
+        }
+    }
+    ret
+}
+
+fn ncc_sum_table_sum(s: &Array2<f32>, (x, y): (usize, usize), (w, h): (usize, usize)) -> f32 {
+    //s[(x + w - 1, y + h - 1)] - s[(x - 1, y + h - 1)] - s[(x + w - 1, y - 1)] + s[(x - 1, y - 1)]
+    let a = s[(x + w - 1, y + h - 1)];
+    let b = s[(x     - 1, y + h - 1)];
+    let c = s[(x + w - 1, y     - 1)];
+    let d = s[(x     - 1, y     - 1)];
+    a - b - c + d
+}
+
+fn ncc_recip_norm(sum: f32, sumsqr: f32, n: usize) -> f32 {
+    // this is ||(r - r_mean)|| == sum(r_i^2 - 2 * r_i * r_mean + r_mean_i^2)
+    // == sum(r_i^2) - sum(r_i)^2 / n
+    let normsqr = sumsqr - sum.powf(2.) / n as f32;
+    let recip_norm = normsqr.powf(-0.5).clamp(0f32.next_up(), f32::INFINITY);
+    recip_norm
+}
+
+fn ncc_norm(sum: f32, sumsqr: f32, n: usize) -> f32 {
+    // this is ||(r - r_mean)|| == sum(r_i^2 - 2 * r_i * r_mean + r_mean_i^2)
+    // == sum(r_i^2) - sum(r_i)^2 / n
+    let normsqr = sumsqr - sum * sum / n as f32;
+    //let norm = normsqr.powf(0.5).clamp(0f32.next_up(), f32::INFINITY);
+    let norm = normsqr.powf(0.5);
+    norm
+}
+
 impl Searcher {
     fn new(img: &GrayImage) -> Searcher {
-        let mut reference = image_to_f32(img);
-        normalize_image(&mut reference);
+        let reference = image_to_f32(img);
+        let sum_table = ncc_sum_table(&reference);
+        let sumsqr_table = ncc_sumsqr_table(&reference);
 
-        let norm = reference.iter().fold(0f64, |acc, x| acc + (*x as f64) * (*x as f64)).sqrt();
         let r_w = img.width() as usize;
         let r_h = img.height() as usize;
         let matches = Vec::with_capacity(1024);
@@ -245,7 +260,9 @@ impl Searcher {
         let needle = vec![0.; 1024];
 
         Searcher {
-            reference: reference.into(),
+            reference,
+            sum_table,
+            sumsqr_table,
             r_w,
             r_h,
             needle,
@@ -266,6 +283,9 @@ impl Searcher {
         }
     }
 
+    // note that we skip the first row and col of reference to make the indexing easier
+    // and because the needle is padded up to N, we won't search the last N - needle.width()
+    // cols (and likewise for rows)
     #[inline(never)]
     fn search_n<const N: usize>(
         &mut self,
@@ -286,10 +306,9 @@ impl Searcher {
 
         let mut min_sim = 1.;
         let mut max_sim = -1.;
-        let divisor = 1. / (n_w as f32 * n_h as f32);
 
         self.acc.fill(0.);
-        self.acc.resize(x_searches, 0.);
+        self.acc.resize(x_searches - 1, 0.);
 
         self.needle.resize(N * n_h as usize, 0.);
         {
@@ -299,15 +318,53 @@ impl Searcher {
         let mask = get_mask_n(n_w);
         let (needle_buf, _rem) = self.needle.as_chunks::<N>();
 
-        for y in 0..y_searches {
+        let recip_needle_norm = 1. / image_norm(needle);
+        let needle_norm = image_norm(needle);
+        //let alpha = needle_norm * 0.1;
+        let alpha = 0.1;
+        eprintln!("needle norm {needle_norm} alpha {alpha}");
+
+        let n = n_w * n_h;
+
+        for y in 1..y_searches {
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
-                let ref_windows = get_row(&self.reference, r_w, y + needle_y).array_windows::<N>();
-                for (acc, ref_row) in self.acc.iter_mut().zip(ref_windows) {
-                    *acc += cross_corr_n(*needle_row, *ref_row, mask) as AccType;
+                // we can either precompute the mean and divisor here, ie do a whole row
+                // or do it online, but then we duplicate the work for each row of the needle
+                //
+                let row = self.reference.get_row(y + needle_y);
+                let ref_windows = row[1..].array_windows::<N>();
+                for (_x, (acc, ref_row)) in self.acc.iter_mut().zip(ref_windows).enumerate() {
+                    // x is offset by 1
+                    //let x = x + 1;
+                    //let s = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
+                    // this is whitespace (all black)
+                    //if s == 0. || s == n as f32 {
+                    //    continue
+                    //}
+                    *acc += cross_corr_n(*needle_row, *ref_row, mask);
                 }
             }
             for (x, acc) in self.acc.iter().enumerate() {
-                let similarity = *acc * divisor;
+                let x = x + 1;
+                let s = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
+                if s == 0. || s == n as f32 {
+                    continue
+                }
+                let ssqr = ncc_sum_table_sum(&self.sumsqr_table, (x, y), (n_w, n_h));
+                let _recip_norm = ncc_recip_norm(s, ssqr, n);
+                let patch_norm = ncc_norm(s, ssqr, n);
+                //if patch_norm < 0.1 {
+                //    continue;
+                //}
+                let d = (patch_norm + alpha) * needle_norm;
+                let similarity = *acc / d;
+                if similarity >= 1. {
+                    eprintln!("high sim acc={acc} patch_norm={patch_norm} needle_norm={needle_norm}");
+                }
+                if similarity.is_nan() || similarity.is_infinite() {
+                    continue;
+                }
+                //assert!(similarity >= -1.1 && similarity <= 1.1, "similarity out of range {similarity}");
                 max_sim = f32::max(max_sim, similarity);
                 min_sim = f32::min(max_sim, similarity);
                 if similarity > threshold {
@@ -449,6 +506,35 @@ fn main() {
 
     let to_px = (1. / font.metrics().units_per_em as f32) * render_options.size;
 
+    if false {
+        let xy = (135, 68);
+        let wh = (8, 10);
+        let mut block_a = searcher.reference.ravel_block(xy, wh);
+        let mut block_b = block_a.clone();
+        normalize_image(&mut block_a);
+        let block_a_norm = image_norm(&block_a);
+        let block_b_norm = image_norm(&block_b);
+        eprintln!("a_norm={block_a_norm} b_norm={block_b_norm}");
+
+        let s = ncc_sum_table_sum(&searcher.sum_table, xy, wh);
+        let ssqr = ncc_sum_table_sum(&searcher.sumsqr_table, xy, wh);
+        let block_b_s = block_b.iter().sum::<f32>();
+        let block_b_ssqr = block_b.iter().map(|x| x * x).sum::<f32>();
+        eprintln!("s={s} ssqr={ssqr} block_b_sum={block_b_s} block_b_ssqr={block_b_ssqr}");
+
+        let n = wh.0 * wh.1;
+        let mean = s / n as f32;
+        let normsqr = ssqr - s.powf(2.) / n as f32;
+        eprintln!("normsqr={normsqr}");
+        let norm = normsqr.sqrt();
+        eprintln!("normsqr={normsqr} norm={norm}");
+        //block_b.iter_mut().for_each(|x| *x = (*x - mean) / norm);
+        block_b.iter_mut().for_each(|x| *x = (*x - mean) * normsqr.powf(-0.5));
+        let block_b_norm = image_norm(&block_b);
+        eprintln!("b_norm={block_b_norm}");
+        return;
+    }
+
     let t00 = Instant::now();
 
     let mut unique_rows = std::collections::HashSet::new();
@@ -512,7 +598,7 @@ fn main() {
                 padding,
             );
             let mut needle = canvas_to_f32(&canvas);
-            normalize_image(&mut needle);
+            center_image(&mut needle);
             // canvas has black as background, count # of pixels which actually have some letter in
             // them
             let size = canvas.size;
@@ -635,30 +721,40 @@ fn main() {
         for (count, diff) in baseline_diff_counts {
             eprintln!("{diff} {count}");
         }
-        // so we jump between 12 and 13 pixels between baselines
-        // so either the text is getting snapped
-        // or the true line spacing is somewhere between
     }
 }
 
-fn image_to_f32(img: &GrayImage) -> Vec<f32> {
-    img.as_raw().iter().map(|x| (255 - *x) as f32 / 255.).collect()
+fn image_to_f32(img: &GrayImage) -> Array2<f32> {
+    let data = img.as_raw().iter().map(|x| (255 - *x) as f32 / 255.).collect();
+    let rows = img.height() as usize;
+    let cols = img.width() as usize;
+    Array2 { data, rows, cols }
 }
 
 fn canvas_to_f32(canvas: &Canvas) -> Vec<f32> {
     canvas.pixels.iter().map(|x| *x as f32 / 255.).collect()
 }
 
-// for NCC, the norm has to be of the window, which is the same for the needle each time,
-// but varies for the image
+fn image_norm(pixels: &[f32]) -> f32 {
+    pixels.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32
+}
+
 fn normalize_image(pixels: &mut [f32]) {
     let mean = pixels.iter().map(|x| *x as f64).sum::<f64>() / pixels.len() as f64;
     let mean = mean as f32;
     pixels.iter_mut().for_each(|x| *x -= mean);
-    //let norm = pixels.iter().fold(0f64, |acc, x| acc + (*x as f64) * (*x as f64)).sqrt();
-    //let norm = (1. / norm) as f32;
-    //pixels.iter_mut().for_each(|x| *x *= norm);
+    let norm = pixels.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    // this should only be called for needles which have at least 1 pixel
+    assert!(norm >= 0.);
+    let norm = (1. / norm) as f32;
+    pixels.iter_mut().for_each(|x| *x *= norm);
 }
+
+fn center_image(pixels: &mut [f32]) {
+    let mean = pixels.iter().map(|x| *x as f64).sum::<f64>() / pixels.len() as f64;
+    pixels.iter_mut().for_each(|x| *x -= mean as f32);
+}
+
 
 fn cross_corr_n<const N: usize>(a: [f32; N], b: [f32; N], mask: [f32; N]) -> f32 {
     let mut ret = 0f32;
