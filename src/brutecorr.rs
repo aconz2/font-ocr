@@ -56,17 +56,19 @@ struct MatchWithBaseline {
     baseline: f32,
 }
 
+type PixelType = f32;
+type AccType = f32;
 type SumTableT = u32;
 type SumSqrTableT = u64;
 
 struct Searcher {
-    reference: Array2<u8>,
+    reference: Array2<PixelType>,
     sum_table: Array2<SumTableT>,
     sumsqr_table: Array2<SumSqrTableT>,
     r_w: usize,
     r_h: usize,
-    acc: Vec<u32>,
-    needle: Vec<u8>,
+    acc: Vec<AccType>,
+    needle: Vec<PixelType>,
     matches: Vec<Match>,
 }
 
@@ -171,32 +173,6 @@ impl<T: Copy> Array2<T> {
     }
 }
 
-fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
-    assert!(canvas.format == Format::A8);
-    let w = canvas.size.x() as u32;
-    let h = canvas.size.y() as u32;
-    let pixels = canvas.pixels.clone();
-    GrayImage::from_raw(w, h, pixels).unwrap()
-}
-
-fn copy_needle_n<const N: usize>(out: &mut [[u8; N]], needle: &[u8], size: Vector2I) {
-    let w = size.x() as usize;
-    for y in 0..(size.y() as usize) {
-        for x in 0..(size.x() as usize) {
-            out[y][x] = needle[y * w + x];
-        }
-    }
-}
-
-fn get_mask_n<const N: usize>(n: usize) -> [u8; N] {
-    assert!(n >= 1 && n <= N);
-    let mut arr = [0; N];
-    for i in 0..n {
-        arr[i] = 1;
-    }
-    arr
-}
-
 // https://isas.iar.kit.edu/pdf/SPIE01_BriechleHanebeck_CrossCorr.pdf
 fn ncc_sum_table(pixels: &Array2<u8>) -> Array2<SumTableT> {
     let mut ret = Array2::<SumTableT>::new(pixels.rows, pixels.cols);
@@ -270,17 +246,19 @@ fn ncc_sumsqr_table_sum(s: &Array2<SumSqrTableT>, (x, y): (usize, usize), (w, h)
 //    norm
 //}
 
+
 impl Searcher {
     fn new(img: &GrayImage) -> Searcher {
         let reference = image_to_u8(img);
         let sum_table = ncc_sum_table(&reference);
         let sumsqr_table = ncc_sumsqr_table(&reference);
+        let reference = image_to_f32(img);
 
         let r_w = img.width() as usize;
         let r_h = img.height() as usize;
         let matches = Vec::with_capacity(1024);
-        let acc = vec![0; img.width() as usize];
-        let needle = vec![0; 1024];
+        let acc = vec![AccType::default(); img.width() as usize];
+        let needle = vec![PixelType::default(); 128];
 
         Searcher {
             reference,
@@ -330,21 +308,24 @@ impl Searcher {
         let mut min_sim = f32::INFINITY;
         let mut max_sim = -f32::INFINITY;
 
-        self.acc.fill(0);
-        self.acc.resize(x_searches - 1, 0);
+        self.acc.fill(AccType::default());
+        self.acc.resize(x_searches - 1, AccType::default());
 
-        self.needle.resize(N * n_h as usize, 0);
+        self.needle.resize(N * n_h as usize, PixelType::default());
         {
             let (rows, _rem) = self.needle.as_chunks_mut::<N>();
-            copy_needle_n(rows, needle, size);
+            copy_needle_n_f32(rows, needle, size);
         }
-        let mask = get_mask_n(n_w);
+        let mask = get_mask_n_f32(n_w);
         let (needle_buf, _rem) = self.needle.as_chunks::<N>();
 
         let n = n_w * n_h;
 
         // sum_needle sumsqr_needle
-        let (s_n, s2_n) = image_centered_var(needle);
+        let (s_n, s2_n) = image_sum_sumsqr(needle);
+        if s_n == 0 {
+            return &self.matches;
+        }
 
         // we calculate NCC, which is normally
         //     (x-x') (y-y')
@@ -364,29 +345,29 @@ impl Searcher {
                 let ref_windows = row[1..].array_windows::<N>();
                 for (_x, (acc, ref_row)) in self.acc.iter_mut().zip(ref_windows).enumerate() {
                     // x is offset by 1
-                    *acc += cross_corr_n(*needle_row, *ref_row, mask) as u32;
+                    //*acc += cross_corr_n_u8(*needle_row, *ref_row, mask);
+                    *acc += cross_corr_n_f32(*needle_row, *ref_row, mask);
                 }
             }
             for (x, acc) in self.acc.iter().enumerate() {
+                // x is offset by 1
                 let x = x + 1;
                 let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
                 let s2_p = ncc_sumsqr_table_sum(&self.sumsqr_table, (x, y), (n_w, n_h));
                 if s_p == 0 {
                     continue;
                 }
-                let num = *acc as f64 - (s_n * s_p) as f64 / n as f64;
+                let num = *acc as f64 - (s_n as u64 * s_p as u64) as f64 / n as f64;
                 if num < 0. {
                     continue;
                 }
-                let norm2_n = s2_n as f64 - (s_n * s_n) as f64 / n as f64;
-                let norm2_p = s2_p as f64 - (s_p * s_p) as f64 / n as f64;
-                assert!(norm2_n > 0.);
-                assert!(norm2_p > 0.);
+                let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64 ) as f64 / n as f64;
+                let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64 ) as f64 / n as f64;
+                debug_assert!(norm2_n > 0.);
+                debug_assert!(norm2_p > 0.);
                 let den = (norm2_n * norm2_p).sqrt();
-                //let den = norm2_n.sqrt() * norm2_p.sqrt();
                 let similarity = (num as f64 / den) as f32;
-                //let similarity = ((*acc as f64) / den - ((s_n * s_p) as f64 / n as f64) / den) as f32;
-                assert!(similarity >= -1.01 && similarity <= 1.01, "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}");
+                debug_assert!(similarity >= -1.01 && similarity <= 1.01, "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}");
                 max_sim = f32::max(max_sim, similarity);
                 min_sim = f32::min(max_sim, similarity);
                 if similarity > threshold {
@@ -397,7 +378,7 @@ impl Searcher {
                     self.matches.push(Match { similarity, rect });
                 }
             }
-            self.acc.fill(0);
+            self.acc.fill(AccType::default());
         }
         eprintln!("max sim {max_sim} min sim {min_sim}");
         &self.matches
@@ -501,9 +482,11 @@ fn main() {
             let advance = (font.advance(glyph_id).unwrap() * to_px).x();
             let bearing_y = typo_bounds_px.origin().y() + typo_bounds_px.height();
             let bearing_x = typo_bounds_px.origin().x();
-            eprintln!(
-                "`{char}` {typo_bounds_px:?}px advance={advance} bearing_x={bearing_x} bearing_y={bearing_y}"
-            );
+            if false {
+                eprintln!(
+                    "`{char}` {typo_bounds_px:?}px advance={advance} bearing_x={bearing_x} bearing_y={bearing_y}"
+                );
+            }
         }
 
         let alphabet_bbox = args.alphabet.chars().fold(RectF::default(), |bounds, c| {
@@ -593,7 +576,7 @@ fn main() {
                 canvas_cache.take(),
                 padding,
             );
-            let mut needle = canvas_to_u8(&canvas);
+            let needle = canvas_to_u8(&canvas);
             let size = canvas.size;
             if args.count_unique {
                 total_rows += size.y() as usize;
@@ -721,7 +704,7 @@ fn main() {
 }
 
 fn image_to_f32(img: &GrayImage) -> Array2<f32> {
-    let data = img.as_raw().iter().map(|x| (255 - *x) as f32 / 255.).collect();
+    let data = img.as_raw().iter().map(|x| (255 - *x) as f32).collect();
     let rows = img.height() as usize;
     let cols = img.width() as usize;
     Array2 { data, rows, cols }
@@ -753,7 +736,7 @@ fn canvas_to_u8(canvas: &Canvas) -> Vec<u8> {
     canvas.pixels.iter().map(|x| *x as u8).collect()
 }
 
-fn image_centered_var(pixels: &[u8]) -> (u32, u32) {
+fn image_sum_sumsqr(pixels: &[u8]) -> (u32, u32) {
     let mut sum = 0u32;
     let mut sum2 = 0u32;
     for p in pixels {
@@ -785,10 +768,63 @@ fn image_centered_var(pixels: &[u8]) -> (u32, u32) {
 //}
 //
 //
-fn cross_corr_n<const N: usize>(a: [u8; N], b: [u8; N], mask: [u8; N]) -> u32 {
+fn cross_corr_n_u8<const N: usize>(a: [u8; N], b: [u8; N], mask: [u8; N]) -> u32 {
     let mut ret = 0u32;
     for i in 0..N {
         ret += a[i] as u32 * b[i] as u32 * mask[i] as u32;
     }
     ret
 }
+
+fn cross_corr_n_f32<const N: usize>(a: [f32; N], b: [f32; N], mask: [f32; N]) -> f32 {
+    let mut ret = 0f32;
+    for i in 0..N {
+        ret += a[i] * b[i] * mask[i];
+    }
+    ret
+}
+
+fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
+    assert!(canvas.format == Format::A8);
+    let w = canvas.size.x() as u32;
+    let h = canvas.size.y() as u32;
+    let pixels = canvas.pixels.clone();
+    GrayImage::from_raw(w, h, pixels).unwrap()
+}
+
+fn copy_needle_n_u8<const N: usize>(out: &mut [[u8; N]], needle: &[u8], size: Vector2I) {
+    let w = size.x() as usize;
+    for y in 0..(size.y() as usize) {
+        for x in 0..(size.x() as usize) {
+            out[y][x] = needle[y * w + x];
+        }
+    }
+}
+
+fn copy_needle_n_f32<const N: usize>(out: &mut [[f32; N]], needle: &[u8], size: Vector2I) {
+    let w = size.x() as usize;
+    for y in 0..(size.y() as usize) {
+        for x in 0..(size.x() as usize) {
+            out[y][x] = needle[y * w + x] as f32;
+        }
+    }
+}
+
+fn get_mask_n_u8<const N: usize>(n: usize) -> [u8; N] {
+    debug_assert!(n >= 1 && n <= N);
+    let mut arr = [0; N];
+    for i in 0..n {
+        arr[i] = 1;
+    }
+    arr
+}
+
+fn get_mask_n_f32<const N: usize>(n: usize) -> [f32; N] {
+    debug_assert!(n >= 1 && n <= N);
+    let mut arr = [0.; N];
+    for i in 0..n {
+        arr[i] = 1.;
+    }
+    arr
+}
+
