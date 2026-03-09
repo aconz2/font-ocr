@@ -57,7 +57,7 @@ struct MatchWithBaseline {
 }
 
 type PixelType = f32;
-type AccType = f32;
+type AccType = u32;
 type SumTableT = u32;
 type SumSqrTableT = u64;
 
@@ -346,7 +346,9 @@ impl Searcher {
                 for (_x, (acc, ref_row)) in self.acc.iter_mut().zip(ref_windows).enumerate() {
                     // x is offset by 1
                     //*acc += cross_corr_n_u8(*needle_row, *ref_row, mask);
-                    *acc += cross_corr_n_f32(*needle_row, *ref_row, mask);
+                    // we really want to accumulate into u32 b/c an f32 dot is only valid for
+                    // templates of up to n=128 == 7 bits + 16 bits from 8bit * 8bit == 23 bits
+                    *acc += cross_corr_n_f32(*needle_row, *ref_row, mask) as u32;
                 }
             }
             for (x, acc) in self.acc.iter().enumerate() {
