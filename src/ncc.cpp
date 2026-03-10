@@ -183,6 +183,9 @@ extern "C" size_t ncc_8_u8(
     /*auto x_searches = r_w - N + 1;*/
     auto y_searches = r_h - N + 1;
 
+    // this is way faster
+#define MANUAL_INTRIN
+
     for (size_t y = 1; y < y_searches; y++) {
         uint16_t start = start_end[y * 2 + 0];
         uint16_t end = start_end[y * 2 + 1];
@@ -191,10 +194,59 @@ extern "C" size_t ncc_8_u8(
             for (size_t x = start; x < end; x++) {
                 auto r = &reference[(y + needle_y) * r_w + x];
                 auto n = &needle_u8[needle_y * N];
+#ifdef MANUAL_INTRIN
+                __m128i n16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)n));
+                __m128i r16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)r));
+
+                // a b c d | e f g h
+                // the madd gives us
+                // 0  1    2  3
+                // ab cd | ef gh
+                // ef gh | ab cd + <- shuffle
+                // abef cdgh efab ghcd
+                // 0    1    2    3
+                // abef cdgh efab ghcd + <- shuffle
+                // cdgh abef ghcd efab
+                auto get_sum = [](__m128i m) {
+                    __m128i sum = _mm_add_epi32(m, _mm_shuffle_epi32(m, _MM_SHUFFLE(2, 3, 0, 1)));
+                    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
+                    return _mm_cvtsi128_si32(sum);
+                };
+
+                uint32_t acc_ = get_sum(_mm_madd_epi16(n16, r16));
+
+                if (needle_y == 0) {
+                    acc[x - 1] = acc_;
+                } else {
+                    acc[x - 1] += acc_;
+                }
+#else
                 uint32_t acc_ = 0;
                 for (size_t i = 0; i < N; i++) {
-                    acc_ += (uint16_t)r[i] * (uint16_t)n[i];
+                    acc_ += r[i] * n[i];
                 }
+                if (needle_y == 0) {
+                    acc[x - 1] = acc_;
+                } else {
+                    acc[x - 1] += acc_;
+                }
+#endif
+            }
+        };
+
+        // doing two rows at once isn't faster
+/*#define DOUBLE*/
+
+#ifdef DOUBLE
+        auto inner2 = [&](size_t needle_y) {
+            for (size_t x = start; x < end; x++) {
+                auto r1 = &reference[(y + needle_y) * r_w + x];
+                auto r2 = &reference[(y + needle_y + 1) * r_w + x];
+                auto n1 = &needle_u8[needle_y * N];
+                auto n2 = &needle_u8[(needle_y + 1) * N];
+                uint32_t acc_ = 0;
+                for (size_t i = 0; i < N; i++) { acc_ += r1[i] * n1[i]; }
+                for (size_t i = 0; i < N; i++) { acc_ += r2[i] * n2[i]; }
                 if (needle_y == 0) {
                     acc[x - 1] = acc_;
                 } else {
@@ -204,9 +256,19 @@ extern "C" size_t ncc_8_u8(
         };
 
         inner(0);
+        size_t needle_y = 1;
+        for (; needle_y + 1 < n_h; needle_y += 2) {
+            inner2(needle_y);
+        }
+        for (; needle_y < n_h; needle_y++) {
+            inner(needle_y);
+        }
+#else
+        inner(0);
         for (size_t needle_y = 1; needle_y < n_h; needle_y++) {
             inner(needle_y);
         }
+#endif
 
         // check num > threshold_d * den, not 100% sure this is numerically accurate
         // is maybe 1% faster
