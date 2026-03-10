@@ -262,14 +262,12 @@ fn draw_test_rectangles(img: &DynamicImage, decode_options: DecodeOptions) -> Dy
         let y = y_start + i * line_advance;
         for x in x_start..=x_start + width {
             ret.get_pixel_mut(x, y).blend(&c);
-            ret.get_pixel_mut(x, y + line_height)
-                .blend(&c);
+            ret.get_pixel_mut(x, y + line_height).blend(&c);
         }
         // vertical
         for y in y..=(y + line_height) {
             ret.get_pixel_mut(x_start, y).blend(&c);
-            ret.get_pixel_mut(x_start + width, y)
-                .blend(&c);
+            ret.get_pixel_mut(x_start + width, y).blend(&c);
         }
     }
     ret.into()
@@ -289,7 +287,8 @@ fn draw_test_text(
         line_height,
         line_advance: _line_advance,
     } = decode_options;
-    let mut img_line = img.clone()
+    let mut img_line = img
+        .clone()
         //.crop_imm(x_start, y_start, width, line_height)
         .into_rgba8();
     let img_text = canvas_to_lum8(&render(font, text, render_options));

@@ -1,7 +1,7 @@
 #![feature(iter_array_chunks)]
 
-use std::time::Instant;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
@@ -672,7 +672,12 @@ fn main() {
             // canvas has black as background, count # of pixels which actually have some letter in
             // them
             //let threshold = canvas.pixels.iter().filter(|x| x > &&0).count() * args.threshold.pow(2);
-            let threshold = canvas.pixels.iter().map(|x| ((*x / 2) as u16).pow(2) as u32).sum::<u32>() as f32 * args.correlation_percent;
+            let threshold = canvas
+                .pixels
+                .iter()
+                .map(|x| ((*x / 2) as u16).pow(2) as u32)
+                .sum::<u32>() as f32
+                * args.correlation_percent;
             let size = canvas.size;
             if args.count_unique {
                 total_rows += size.y() as usize;
@@ -686,7 +691,9 @@ fn main() {
                 let x = (offset[0] * 1000.) as usize;
                 let y = (offset[1] * 1000.) as usize;
                 let im = canvas_to_lum8(&canvas);
-                image::DynamicImage::ImageLuma8(im).save(format!("letters/{letter}-{x}_{y}.png")).unwrap();
+                image::DynamicImage::ImageLuma8(im)
+                    .save(format!("letters/{letter}-{x}_{y}.png"))
+                    .unwrap();
             }
             let t0 = Instant::now();
             let (min, hits) = searcher.search(&canvas.pixels, canvas.size, threshold as AccType);

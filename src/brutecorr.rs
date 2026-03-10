@@ -1,13 +1,13 @@
 #![feature(iter_array_chunks)]
 
-use std::time::Instant;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use clap::Parser;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::freetype::Font;
-use image::{GrayImage};
+use image::GrayImage;
 use pathfinder_geometry::rect::{RectF, RectI};
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
@@ -64,9 +64,9 @@ struct MatchC {
 impl From<MatchC> for Match {
     fn from(m: MatchC) -> Self {
         let rect = RectI::new(
-                Vector2I::new(m.x as i32, m.y as i32),
-                Vector2I::new(m.w as i32, m.h as i32),
-            );
+            Vector2I::new(m.x as i32, m.y as i32),
+            Vector2I::new(m.w as i32, m.h as i32),
+        );
         let similarity = m.similarity;
         Match { rect, similarity }
     }
@@ -87,7 +87,7 @@ unsafe extern "C" {
         threshold: f32,
         out: *mut MatchC,
         n_out: usize,
-        ) -> usize;
+    ) -> usize;
 
     fn ncc_8_u8(
         reference: *const u8,
@@ -105,7 +105,27 @@ unsafe extern "C" {
         threshold: f32,
         out: *mut MatchC,
         n_out: usize,
-        ) -> usize;
+    ) -> usize;
+
+    fn ncc_8_u8_b2(
+        reference: *const u8,
+        r_w: usize,
+        r_h: usize,
+        sum_table: *const u32,
+        sumsqr_table: *const u64,
+        needle_1: *const u8,
+        needle_2: *const u8,
+        needle_u8_1: *const u8,
+        needle_u8_2: *const u8,
+        n_w: usize,
+        n_h: usize,
+        acc: *mut u32,
+        patch_sum: *const u32,
+        patch_norm: *const f64,
+        threshold: f32,
+        out: *mut MatchC,
+        n_out: usize,
+    ) -> usize;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -132,6 +152,7 @@ struct Searcher {
     acc_u32: Vec<u32>,
     needle_f32: Vec<f32>,
     needle_u8: Vec<u8>,
+    needle_u8_2: Vec<u8>,
     matches: Vec<Match>,
     matches_c: Vec<MatchC>,
     last_patch_size: Option<Vector2I>,
@@ -196,6 +217,37 @@ fn render(
     canvas
 }
 
+fn render_batch(
+    font: &Font,
+    chars: impl Iterator<Item = char>,
+    offset: [f32; 2],
+    render_options: RenderOptions,
+    canvas_size: Option<Vector2I>,
+    padding: Vector2I,
+) -> HashMap<Vector2I, Vec<(char, Vec<u8>)>> {
+    let mut ret: HashMap<Vector2I, Vec<(char, Vec<u8>)>> = HashMap::new();
+    let mut canvas_cache = None;
+    for char in chars {
+        let canvas = render(
+            &font,
+            char,
+            offset,
+            render_options,
+            canvas_size,
+            canvas_cache.take(),
+            padding,
+        );
+        let needle = canvas_to_u8(&canvas);
+        let size = canvas.size;
+        if let Some(v) = ret.get_mut(&size) {
+            v.push((char, needle));
+        } else {
+            ret.insert(size, vec![(char, needle)]);
+        }
+    }
+    ret
+}
+
 #[derive(Clone)]
 struct Array2<T: Copy> {
     data: Box<[T]>,
@@ -226,7 +278,7 @@ impl<T: Copy> std::ops::IndexMut<(usize, usize)> for Array2<T> {
 impl<T: Copy> Array2<T> {
     //fn len(&self) -> usize { self.data.len() }
     fn get_row(&self, y: usize) -> &[T] {
-        &self.data[y * self.cols..(y+1) * self.cols]
+        &self.data[y * self.cols..(y + 1) * self.cols]
     }
 
     //fn ravel_block(&self, (x, y): (usize, usize), (w, h): (usize, usize)) -> Vec<T> {
@@ -251,7 +303,8 @@ fn ncc_sum_table(pixels: &Array2<u8>) -> Array2<SumTableT> {
     }
     for y in 1..pixels.rows {
         for x in 1..pixels.cols {
-            ret[(x, y)] = pixels[(x, y)] as SumTableT + ret[(x - 1, y)] + ret[(x, y - 1)] - ret[(x - 1, y - 1)];
+            ret[(x, y)] = pixels[(x, y)] as SumTableT + ret[(x - 1, y)] + ret[(x, y - 1)]
+                - ret[(x - 1, y - 1)];
         }
     }
     ret
@@ -279,18 +332,22 @@ fn ncc_sumsqr_table(pixels: &Array2<u8>) -> Array2<SumSqrTableT> {
 fn ncc_sum_table_sum(s: &Array2<u32>, (x, y): (usize, usize), (w, h): (usize, usize)) -> u32 {
     //s[(x + w - 1, y + h - 1)] - s[(x - 1, y + h - 1)] - s[(x + w - 1, y - 1)] + s[(x - 1, y - 1)]
     let a = s[(x + w - 1, y + h - 1)] as i64;
-    let b = s[(x     - 1, y + h - 1)] as i64;
-    let c = s[(x + w - 1, y     - 1)] as i64;
-    let d = s[(x     - 1, y     - 1)] as i64;
+    let b = s[(x - 1, y + h - 1)] as i64;
+    let c = s[(x + w - 1, y - 1)] as i64;
+    let d = s[(x - 1, y - 1)] as i64;
     (a - b - c + d) as u32
 }
 
-fn ncc_sumsqr_table_sum(s: &Array2<SumSqrTableT>, (x, y): (usize, usize), (w, h): (usize, usize)) -> SumSqrTableT {
+fn ncc_sumsqr_table_sum(
+    s: &Array2<SumSqrTableT>,
+    (x, y): (usize, usize),
+    (w, h): (usize, usize),
+) -> SumSqrTableT {
     //s[(x + w - 1, y + h - 1)] - s[(x - 1, y + h - 1)] - s[(x + w - 1, y - 1)] + s[(x - 1, y - 1)]
     let a = s[(x + w - 1, y + h - 1)] as i64;
-    let b = s[(x     - 1, y + h - 1)] as i64;
-    let c = s[(x + w - 1, y     - 1)] as i64;
-    let d = s[(x     - 1, y     - 1)] as i64;
+    let b = s[(x - 1, y + h - 1)] as i64;
+    let c = s[(x + w - 1, y - 1)] as i64;
+    let d = s[(x - 1, y - 1)] as i64;
     (a - b - c + d) as u64
 }
 
@@ -311,7 +368,6 @@ fn ncc_sumsqr_table_sum(s: &Array2<SumSqrTableT>, (x, y): (usize, usize), (w, h)
 //    norm
 //}
 
-
 impl Searcher {
     fn new(img: &GrayImage) -> Searcher {
         let reference_u8 = image_to_u8(img);
@@ -326,6 +382,7 @@ impl Searcher {
         let acc_u32 = vec![0; img.width() as usize];
         let needle_f32 = vec![0.; 128];
         let needle_u8 = vec![0; 128];
+        let needle_u8_2 = vec![0; 128];
         let last_patch_size = None;
 
         Searcher {
@@ -334,6 +391,7 @@ impl Searcher {
             sum_table,
             sumsqr_table,
             needle_u8,
+            needle_u8_2,
             needle_f32,
             acc_u32,
             matches,
@@ -415,7 +473,6 @@ impl Searcher {
             }
 
             let x_searches = self.reference_f32.cols - N + 1;
-            self.acc_u32.fill(0);
             self.acc_u32.resize(x_searches - 1, 0);
             let n_matches = unsafe {
                 ncc_8_u8(
@@ -434,7 +491,7 @@ impl Searcher {
                     threshold,
                     self.matches_c.as_mut_ptr(),
                     self.matches_c.len(),
-                    )
+                )
             };
             if n_matches == MAX_MATCHES {
                 eprintln!("WARN got >= {n_matches} matches");
@@ -450,6 +507,60 @@ impl Searcher {
         }
     }
 
+    fn search_c_u8_b2(&mut self, n1: &[u8], n2: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+        self.prepare_for_size(size);
+        let n_h = size.y() as usize;
+        let n_w = size.x() as usize;
+        if n_w <= 8 {
+            const N: usize = 8;
+
+            self.needle_u8.resize(N * n_h as usize, 0);
+            {
+                let (rows, _rem) = self.needle_u8.as_chunks_mut::<N>();
+                copy_needle_n_u8(rows, n1, size);
+            }
+
+            self.needle_u8_2.resize(N * n_h as usize, 0);
+            {
+                let (rows, _rem) = self.needle_u8_2.as_chunks_mut::<N>();
+                copy_needle_n_u8(rows, n2, size);
+            }
+
+            let x_searches = self.reference_f32.cols - N + 1;
+            self.acc_u32.resize((x_searches - 1) * 2, 0);
+            let n_matches = unsafe {
+                ncc_8_u8_b2(
+                    self.reference_u8.data.as_ptr(),
+                    self.reference_u8.cols,
+                    self.reference_u8.rows,
+                    self.sum_table.data.as_ptr(),
+                    self.sumsqr_table.data.as_ptr(),
+                    n1.as_ptr(),
+                    n2.as_ptr(),
+                    self.needle_u8.as_ptr(),
+                    self.needle_u8_2.as_ptr(),
+                    n_w,
+                    n_h,
+                    self.acc_u32.as_mut_ptr(),
+                    self.patch_sum.data.as_ptr(),
+                    self.patch_norm.data.as_ptr(),
+                    threshold,
+                    self.matches_c.as_mut_ptr(),
+                    self.matches_c.len(),
+                )
+            };
+            if n_matches == MAX_MATCHES {
+                eprintln!("WARN got >= {n_matches} matches");
+            }
+            self.matches.clear();
+            for m in self.matches_c.iter().take(n_matches) {
+                self.matches.push((*m).into());
+            }
+            &self.matches
+        } else {
+            todo!()
+        }
+    }
 
     fn search_c_f32(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
         self.prepare_for_size(size);
@@ -460,7 +571,8 @@ impl Searcher {
             let max_matches = 1024;
             self.matches_c.resize(max_matches, MatchC::default());
 
-            self.needle_f32.resize(N * n_h as usize, PixelType::default());
+            self.needle_f32
+                .resize(N * n_h as usize, PixelType::default());
             {
                 let (rows, _rem) = self.needle_f32.as_chunks_mut::<N>();
                 copy_needle_n_f32(rows, needle, size);
@@ -484,7 +596,7 @@ impl Searcher {
                     threshold,
                     self.matches_c.as_mut_ptr(),
                     self.matches_c.len(),
-                    )
+                )
             };
             if n_matches == max_matches {
                 eprintln!("WARN got >= {n_matches} matches");
@@ -526,7 +638,8 @@ impl Searcher {
 
         self.acc_u32.resize(x_searches - 1, AccType::default());
 
-        self.needle_f32.resize(N * n_h as usize, PixelType::default());
+        self.needle_f32
+            .resize(N * n_h as usize, PixelType::default());
         {
             let (rows, _rem) = self.needle_f32.as_chunks_mut::<N>();
             copy_needle_n_f32(rows, needle, size);
@@ -554,7 +667,6 @@ impl Searcher {
 
         for y in 1..y_searches {
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
-
                 let row = self.reference_f32.get_row(y + needle_y);
                 let ref_windows = row[1..].array_windows::<N>();
                 for (x, (acc, ref_row)) in self.acc_u32.iter_mut().zip(ref_windows).enumerate() {
@@ -585,20 +697,23 @@ impl Searcher {
                 if num < 0. {
                     continue;
                 }
-                let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64 ) as f64 / n as f64;
-                let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64 ) as f64 / n as f64;
+                let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64) as f64 / n as f64;
+                let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64) as f64 / n as f64;
                 debug_assert!(norm2_n > 0.);
                 debug_assert!(norm2_p > 0.);
                 let den = (norm2_n * norm2_p).sqrt();
                 let similarity = (num as f64 / den) as f32;
-                debug_assert!(similarity >= -1.01 && similarity <= 1.01, "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}");
+                debug_assert!(
+                    similarity >= -1.01 && similarity <= 1.01,
+                    "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}"
+                );
                 max_sim = f32::max(max_sim, similarity);
                 min_sim = f32::min(max_sim, similarity);
                 if similarity > threshold {
                     let rect = RectI::new(
-                            Vector2I::new(x as i32, y as i32),
-                            Vector2I::new(n_w as i32, n_h as i32),
-                        );
+                        Vector2I::new(x as i32, y as i32),
+                        Vector2I::new(n_w as i32, n_h as i32),
+                    );
                     self.matches.push(Match { similarity, rect });
                 }
             }
@@ -647,7 +762,6 @@ impl Searcher {
 
         for y in 1..y_searches {
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
-
                 let row = self.reference_u8.get_row(y + needle_y);
                 let ref_windows = row[1..].array_windows::<N>();
                 for (_x, (acc, ref_row)) in self.acc_u32.iter_mut().zip(ref_windows).enumerate() {
@@ -670,20 +784,23 @@ impl Searcher {
                 if num < 0. {
                     continue;
                 }
-                let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64 ) as f64 / n as f64;
-                let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64 ) as f64 / n as f64;
+                let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64) as f64 / n as f64;
+                let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64) as f64 / n as f64;
                 debug_assert!(norm2_n > 0.);
                 debug_assert!(norm2_p > 0.);
                 let den = (norm2_n * norm2_p).sqrt();
                 let similarity = (num as f64 / den) as f32;
-                debug_assert!(similarity >= -1.01 && similarity <= 1.01, "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}");
+                debug_assert!(
+                    similarity >= -1.01 && similarity <= 1.01,
+                    "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}"
+                );
                 max_sim = f32::max(max_sim, similarity);
                 min_sim = f32::min(max_sim, similarity);
                 if similarity > threshold {
                     let rect = RectI::new(
-                            Vector2I::new(x as i32, y as i32),
-                            Vector2I::new(n_w as i32, n_h as i32),
-                        );
+                        Vector2I::new(x as i32, y as i32),
+                        Vector2I::new(n_w as i32, n_h as i32),
+                    );
                     self.matches.push(Match { similarity, rect });
                 }
             }
@@ -743,6 +860,9 @@ struct Args {
 
     #[arg(long)]
     u8: bool,
+
+    #[arg(long)]
+    batch: bool,
 }
 
 fn main() {
@@ -830,12 +950,12 @@ fn main() {
 
     let t00 = Instant::now();
 
-    let mut unique_rows = std::collections::HashSet::new();
+    //let mut unique_rows = std::collections::HashSet::new();
     let mut total_rows = 0;
 
     let mut hits_by_char: HashMap<_, _> = args.alphabet.chars().map(|c| (c, 0)).collect();
     let mut all_hits = Vec::with_capacity(4096);
-    let mut canvas_cache = None;
+    //let mut canvas_cache = None;
     for offset in &offsets {
         let (y_offset, canvas_size) = match box_size {
             BoxSize::Font => {
@@ -879,117 +999,157 @@ fn main() {
             _ => (0., None),
         };
         let corrected_offset = [offset[0], offset[1] + y_offset];
-        for letter in args.alphabet.chars() {
-            let t0 = Instant::now();
-            let canvas = render(
-                &font,
-                letter,
-                corrected_offset,
-                render_options,
-                canvas_size,
-                canvas_cache.take(),
-                padding,
-            );
-            let needle = canvas_to_u8(&canvas);
-            let size = canvas.size;
-            if args.count_unique {
-                total_rows += size.y() as usize;
-                for y in 0..size.y() as usize {
-                    let row =
-                        canvas.pixels[y * size.x() as usize..(y + 1) * size.x() as usize].to_vec();
-                    unique_rows.insert(row);
+        let batch = render_batch(
+            &font,
+            args.alphabet.chars(),
+            corrected_offset,
+            render_options,
+            canvas_size,
+            padding,
+        );
+        if args.batch {
+            for (size, batch) in batch.iter() {
+                let (pairs, rem) = batch.as_chunks::<2>();
+                // TODO do remainder
+                for [(l1, n1), (l2, n2)] in pairs {
+                    //let t0 = Instant::now();
+                    let size = *size;
+                    let hits = searcher.search_c_u8_b2(&n1, &n2, size, args.threshold);
+                    let bearing_x = 0; // TODO for multi char
+                    let mut last_rect = RectI::default();
+                    for hit in hits {
+                        if hit.rect.intersects(last_rect) {
+                            continue;
+                        }
+                        all_hits.push(MatchWithBaseline {
+                            similarity: hit.similarity,
+                            rect: hit.rect,
+                            baseline: corrected_offset[1],
+                        });
+                        last_rect = hit.rect;
+                        let ul = hit.rect.origin();
+                        let pt = hit.rect.to_f32().center();
+                        println!(
+                            "{},{},{},{},{},{},{},{},{},{}",
+                            pt.x(),
+                            pt.y(),
+                            ul.x(),
+                            ul.y(),
+                            hit.rect.width(),
+                            hit.rect.height(),
+                            bearing_x,
+                            corrected_offset[1],
+                            offset[0],
+                            offset[1],
+                        );
+                    }
+                    n_hits += hits.len();
                 }
             }
-            if args.save_letters {
-                let x = (offset[0] * 1000.) as usize;
-                let y = (offset[1] * 1000.) as usize;
-                let im = canvas_to_lum8(&canvas);
-                image::DynamicImage::ImageLuma8(im).save(format!("letters/{letter}-{x}_{y}.png")).unwrap();
-            }
-            if args.u8 {
 
-            } else {
+        } else {
+            for (size, batch) in batch.iter() {
+                for (letter, needle) in batch {
+                    let t0 = Instant::now();
+                    let size = *size;
+                    let letter = *letter;
+                    //if args.count_unique {
+                    //    total_rows += size.y() as usize;
+                    //    for y in 0..size.y() as usize {
+                    //        let row = canvas.pixels[y * size.x() as usize..(y + 1) * size.x() as usize]
+                    //            .to_vec();
+                    //        unique_rows.insert(row);
+                    //    }
+                    //}
+                    //if args.save_letters {
+                    //    let x = (offset[0] * 1000.) as usize;
+                    //    let y = (offset[1] * 1000.) as usize;
+                    //    let im = canvas_to_lum8(&canvas);
+                    //    image::DynamicImage::ImageLuma8(im)
+                    //        .save(format!("letters/{letter}-{x}_{y}.png"))
+                    //        .unwrap();
+                    //}
+                    let hits = if args.u8 {
+                        if args.c {
+                            searcher.search_c_u8(&needle, size, args.threshold)
+                        } else {
+                            searcher.search_u8(&needle, size, args.threshold)
+                        }
+                    } else {
+                        if args.c {
+                            searcher.search_c_f32(&needle, size, args.threshold)
+                        } else {
+                            searcher.search_f32(&needle, size, args.threshold)
+                        }
+                    };
+                    let t1 = Instant::now();
+                    eprintln!(
+                        "`{letter}` {offset:?} needle size {}x{} hits {} elapsed {}ms",
+                        size.x(),
+                        size.y(),
+                        hits.len(),
+                        (t1 - t0).as_millis()
+                    );
+                    n_hits += hits.len();
 
+                    let glyph_id = font.glyph_for_char(letter).unwrap();
+                    let units_per_em = font.metrics().units_per_em as f32;
+                    let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * to_px;
+                    let _bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
+                    let bearing_x = glyph_bounds.origin().x();
+                    let _ascent_px = font.metrics().ascent * (1. / units_per_em) * render_options.size;
+                    let mut last_rect = RectI::default();
+                    let mut non_overlapping_hits = 0;
+                    for hit in hits {
+                        if hit.rect.intersects(last_rect) {
+                            continue;
+                        }
+                        non_overlapping_hits += 1;
+                        all_hits.push(MatchWithBaseline {
+                            similarity: hit.similarity,
+                            rect: hit.rect,
+                            baseline: corrected_offset[1],
+                        });
+                        last_rect = hit.rect;
+                        //total_error += hit.error;
+                        let ul = hit.rect.origin();
+                        let pt = hit.rect.to_f32().center();
+                        println!(
+                            "{},{},{},{},{},{},{},{},{},{}",
+                            pt.x(),
+                            pt.y(),
+                            ul.x(),
+                            ul.y(),
+                            hit.rect.width(),
+                            hit.rect.height(),
+                            bearing_x,
+                            corrected_offset[1],
+                            offset[0],
+                            offset[1],
+                        );
+                        //eprintln!("HIT {},{} offset {:?}", pt.x(), pt.y(), offset);
+                    }
+                    if let Some(entry) = hits_by_char.get_mut(&letter) {
+                        *entry += non_overlapping_hits;
+                    } else {
+                        assert!(false);
+                    };
+                    //eprintln!("took {:.4}ms", (t1 - t0).as_millis());
+                }
             }
-            let hits = if args.u8 {
-                if args.c {
-                    searcher.search_c_u8(&needle, canvas.size, args.threshold)
-                } else {
-                    searcher.search_u8(&needle, canvas.size, args.threshold)
-                }
-            } else {
-                if args.c {
-                    searcher.search_c_f32(&needle, canvas.size, args.threshold)
-                } else {
-                    searcher.search_f32(&needle, canvas.size, args.threshold)
-                }
-            };
-            let t1 = Instant::now();
-            let _ = canvas_cache.insert(canvas);
-            eprintln!(
-                "`{letter}` {offset:?} needle size {}x{} hits {} elapsed {}ms",
-                size.x(),
-                size.y(),
-                hits.len(),
-                (t1 - t0).as_millis()
-            );
-            n_hits += hits.len();
 
-            let glyph_id = font.glyph_for_char(letter).unwrap();
-            let units_per_em = font.metrics().units_per_em as f32;
-            let glyph_bounds = font.typographic_bounds(glyph_id).unwrap() * to_px;
-            let _bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
-            let bearing_x = glyph_bounds.origin().x();
-            let _ascent_px = font.metrics().ascent * (1. / units_per_em) * render_options.size;
-            let mut last_rect = RectI::default();
-            let mut non_overlapping_hits = 0;
-            for hit in hits {
-                if hit.rect.intersects(last_rect) {
-                    continue;
-                }
-                non_overlapping_hits += 1;
-                all_hits.push(MatchWithBaseline {
-                    similarity: hit.similarity,
-                    rect: hit.rect,
-                    baseline: corrected_offset[1],
-                });
-                last_rect = hit.rect;
-                //total_error += hit.error;
-                let ul = hit.rect.origin();
-                let pt = hit.rect.to_f32().center();
-                println!(
-                    "{},{},{},{},{},{},{},{},{},{}",
-                    pt.x(),
-                    pt.y(),
-                    ul.x(),
-                    ul.y(),
-                    hit.rect.width(),
-                    hit.rect.height(),
-                    bearing_x,
-                    corrected_offset[1],
-                    offset[0],
-                    offset[1],
-                );
-                //eprintln!("HIT {},{} offset {:?}", pt.x(), pt.y(), offset);
-            }
-            if let Some(entry) = hits_by_char.get_mut(&letter) {
-                *entry += non_overlapping_hits;
-            } else {
-                assert!(false);
-            };
-            //eprintln!("took {:.4}ms", (t1 - t0).as_millis());
         }
     }
     let t11 = Instant::now();
     eprintln!("overall {:.4}ms", (t11 - t00).as_millis());
-    if args.count_unique {
-        eprintln!(
-            "saw {} unique rows out of {} == {:.2}%",
-            unique_rows.len(),
-            total_rows,
-            unique_rows.len() as f32 / total_rows as f32 * 100.
-        );
-    }
+    //if args.count_unique {
+    //    eprintln!(
+    //        "saw {} unique rows out of {} == {:.2}%",
+    //        unique_rows.len(),
+    //        total_rows,
+    //        unique_rows.len() as f32 / total_rows as f32 * 100.
+    //    );
+    //}
     //let avg_error = total_error as f32 / n_hits as f32;
     //eprintln!("hits: {n_hits} error per hit:{avg_error}");
     eprintln!("hits: {n_hits}");
