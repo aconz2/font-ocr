@@ -104,8 +104,6 @@ unsafe extern "C" {
         reference: *const u8,
         r_w: usize,
         r_h: usize,
-        sum_table: *const u32,
-        sumsqr_table: *const u64,
         needle: *const u8,
         needle_u8: *const u8,
         n_w: usize,
@@ -113,6 +111,7 @@ unsafe extern "C" {
         acc: *mut u32,
         patch_sum: *const u32,
         patch_norm: *const f64,
+        start_end: *const u16,
         threshold: f32,
         out: *mut MatchC,
         n_out: usize,
@@ -139,13 +138,13 @@ struct Searcher {
     patch_norm: Array2<f64>,
     sum_table: Array2<SumTableT>,
     sumsqr_table: Array2<SumSqrTableT>,
-    //acc_f32: Vec<f32>,
     acc_u32: Vec<u32>,
     needle_f32: Vec<f32>,
     needle_u8: Vec<u8>,
     matches: Vec<Match>,
     matches_c: Vec<MatchC>,
     last_patch_size: Option<Vector2I>,
+    start_end: Vec<u16>,
 }
 
 fn render(
@@ -275,16 +274,37 @@ fn ncc_sumsqr_table(pixels: &Array2<u8>) -> Array2<SumSqrTableT> {
     ret
 }
 
-fn ncc_sum_table_sum(s: &Array2<u32>, (x, y): (usize, usize), (w, h): (usize, usize)) -> u32 {
+fn ncc_sum_table_sum_nz(s: &Array2<u32>, (x, y): (usize, usize), (w, h): (usize, usize)) -> u32 {
     //s[(x + w - 1, y + h - 1)] - s[(x - 1, y + h - 1)] - s[(x + w - 1, y - 1)] + s[(x - 1, y - 1)]
     let a = s[(x + w - 1, y + h - 1)] as i64;
     let b = s[(x - 1, y + h - 1)] as i64;
     let c = s[(x + w - 1, y - 1)] as i64;
     let d = s[(x - 1, y - 1)] as i64;
-    (a - b - c + d) as u32
+    (a - b + d - c) as u32
 }
 
-fn ncc_sumsqr_table_sum(
+//fn ncc_sum_table_sum(s: &Array2<u32>, (x, y): (usize, usize), (w, h): (usize, usize)) -> u32 {
+//    //s[(x + w - 1, y + h - 1)] - s[(x - 1, y + h - 1)] - s[(x + w - 1, y - 1)] + s[(x - 1, y - 1)]
+//    let a = s[(x + w - 1, y + h - 1)] as i64;
+//    let b = if x == 0 {
+//        0
+//    } else {
+//        s[(x - 1, y + h - 1)] as i64
+//    };
+//    let c = if y == 0 {
+//        0
+//    } else {
+//        s[(x + w - 1, y - 1)] as i64
+//    };
+//    let d = if x == 0 || y == 0 {
+//        0
+//    } else {
+//        s[(x - 1, y - 1)] as i64
+//    };
+//    (a - b + d - c) as u32
+//}
+
+fn ncc_sumsqr_table_sum_nz(
     s: &Array2<SumSqrTableT>,
     (x, y): (usize, usize),
     (w, h): (usize, usize),
@@ -294,8 +314,29 @@ fn ncc_sumsqr_table_sum(
     let b = s[(x - 1, y + h - 1)] as i64;
     let c = s[(x + w - 1, y - 1)] as i64;
     let d = s[(x - 1, y - 1)] as i64;
-    (a - b - c + d) as u64
+    (a - b + d - c) as u64
 }
+
+//fn ncc_sumsqr_table_sum(s: &Array2<SumSqrTableT>, (x, y): (usize, usize), (w, h): (usize, usize)) -> SumSqrTableT {
+//    //s[(x + w - 1, y + h - 1)] - s[(x - 1, y + h - 1)] - s[(x + w - 1, y - 1)] + s[(x - 1, y - 1)]
+//    let a = s[(x + w - 1, y + h - 1)] as i64;
+//    let b = if x == 0 {
+//        0
+//    } else {
+//        s[(x - 1, y + h - 1)] as i64
+//    };
+//    let c = if y == 0 {
+//        0
+//    } else {
+//        s[(x + w - 1, y - 1)] as i64
+//    };
+//    let d = if x == 0 || y == 0 {
+//        0
+//    } else {
+//        s[(x - 1, y - 1)] as i64
+//    };
+//    (a - b + d - c) as u64
+//}
 
 impl Searcher {
     fn new(img: &GrayImage) -> Searcher {
@@ -312,6 +353,7 @@ impl Searcher {
         let needle_f32 = vec![0.; 128];
         let needle_u8 = vec![0; 128];
         let last_patch_size = None;
+        let start_end = vec![0; img.height() as usize * 2];
 
         Searcher {
             reference_f32,
@@ -326,6 +368,7 @@ impl Searcher {
             last_patch_size,
             patch_sum,
             patch_norm,
+            start_end,
         }
     }
 
@@ -346,13 +389,41 @@ impl Searcher {
         let y_searches = r_h - n_h + 1;
 
         for y in 1..y_searches {
-            for x in 1..x_searches {
-                let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
-                let s2_p = ncc_sumsqr_table_sum(&self.sumsqr_table, (x, y), (n_w, n_h));
+            let start = {
+                let mut x = 1;
+                while x < x_searches {
+                    let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
+                    if s_p != 0 {
+                        break;
+                    }
+                    x += 1;
+                }
+                x
+            };
+            let end = {
+                let mut x = x_searches - 1;
+                while x > start {
+                    let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
+                    if s_p != 0 {
+                        break;
+                    }
+                    x -= 1;
+                }
+                x + 1
+            };
+            //if start != end {
+            //    debug_assert!(ncc_sum_table_sum_nz(&self.sum_table, (start, y), (n_w, n_h)) != 0, "start y={y} start={start} end={end}");
+            //    debug_assert!(ncc_sum_table_sum_nz(&self.sum_table, (end - 1, y), (n_w, n_h)) != 0, "end y={y} start={start} end={end}");
+            //}
+            for x in start..end {
+                let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
+                let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
                 let norm = s2_p as f64 - ((s_p as u64 * s_p as u64) as f64) / n as f64;
                 self.patch_sum[(x, y)] = s_p;
-                self.patch_norm[(x, y)] = norm;
+                self.patch_norm[(x, y)] = norm.sqrt();
             }
+            self.start_end[y * 2 + 0] = start.try_into().unwrap();
+            self.start_end[y * 2 + 1] = end.try_into().unwrap();
         }
 
         self.last_patch_size = Some(size);
@@ -398,14 +469,13 @@ impl Searcher {
             }
 
             let x_searches = self.reference_f32.cols - N + 1;
-            self.acc_u32.resize(x_searches - 1, 0);
+            self.acc_u32.resize((x_searches - 1) * 8, 0);
+
             let n_matches = unsafe {
                 ncc_8_u8(
                     self.reference_u8.data.as_ptr(),
                     self.reference_u8.cols,
                     self.reference_u8.rows,
-                    self.sum_table.data.as_ptr(),
-                    self.sumsqr_table.data.as_ptr(),
                     needle.as_ptr(),
                     self.needle_u8.as_ptr(),
                     n_w,
@@ -413,6 +483,7 @@ impl Searcher {
                     self.acc_u32.as_mut_ptr(),
                     self.patch_sum.data.as_ptr(),
                     self.patch_norm.data.as_ptr(),
+                    self.start_end.as_ptr(),
                     threshold,
                     self.matches_c.as_mut_ptr(),
                     self.matches_c.len(),
@@ -543,7 +614,7 @@ impl Searcher {
                 let x = x + 1;
                 //let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
                 let s_p = self.patch_sum[(x, y)];
-                let s2_p = ncc_sumsqr_table_sum(&self.sumsqr_table, (x, y), (n_w, n_h));
+                let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
                 if s_p == 0 {
                     continue;
                 }
@@ -629,8 +700,8 @@ impl Searcher {
             for (x, acc) in self.acc_u32.iter().enumerate() {
                 // x is offset by 1
                 let x = x + 1;
-                let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
-                let s2_p = ncc_sumsqr_table_sum(&self.sumsqr_table, (x, y), (n_w, n_h));
+                let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
+                let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
                 if s_p == 0 {
                     continue;
                 }

@@ -73,8 +73,7 @@ extern "C" size_t ncc_8_f32(
 
     uint32_t s_n = 0;
     uint32_t s2_n = 0;
-#pragma nounroll
-#pragma clang loop vectorize(disable)
+
     for (size_t i = 0; i < n_w * n_h; i++) {
         s_n += needle[i];
         s2_n += (uint32_t)needle[i] * (uint32_t)needle[i];
@@ -85,14 +84,8 @@ extern "C" size_t ncc_8_f32(
     auto x_searches = r_w - N + 1;
     auto y_searches = r_h - N + 1;
 
-#pragma nounroll
-#pragma clang loop vectorize(disable)
     for (size_t y = 1; y < y_searches; y++) {
-#pragma nounroll
-#pragma clang loop vectorize(disable)
         for (size_t needle_y = 0; needle_y < n_h; needle_y++) {
-/*#pragma nounroll*/
-#pragma clang loop vectorize(disable)
             for (size_t x = 1; x < x_searches; x++) {
                 auto r = &reference[(y + needle_y) * r_w + x];
                 auto n = &needle_f32[needle_y * N];
@@ -118,8 +111,6 @@ extern "C" size_t ncc_8_f32(
             }
         }
 
-/*#pragma nounroll*/
-#pragma clang loop vectorize(disable)
         for (size_t x = 1; x < x_searches; x++) {
             uint32_t acc_ = acc[x - 1];
             uint32_t s_p = ncc_sum_table_sum(sum_table, r_w, x, y, n_w, n_h);
@@ -158,8 +149,6 @@ extern "C" size_t ncc_8_u8(
     uint8_t* __restrict reference,
     size_t r_w,
     size_t r_h,
-    uint32_t* sum_table,
-    uint64_t* sumsqr_table,
     uint8_t* needle,
     uint8_t* __restrict needle_u8, // this is N * n_h sized
     size_t n_w,
@@ -167,10 +156,12 @@ extern "C" size_t ncc_8_u8(
     uint32_t* acc,
     uint32_t* patch_sum,
     double* patch_norm,
+    uint16_t* start_end,
     float threshold,
     Match* out,
     size_t n_out
         ) {
+    double threshold_d = threshold;
 
     Match* out_cur = out;
     Match* out_fin = out + n_out;
@@ -186,14 +177,18 @@ extern "C" size_t ncc_8_u8(
         s2_n += (uint32_t)needle[i] * (uint32_t)needle[i];
     }
     double norm2_n = (double)s2_n - (double)((uint64_t)s_n * (uint64_t)s_n) / (double)n;
+    double norm_n = sqrt(norm2_n);
     assert(s_n != 0);
 
-    auto x_searches = r_w - N + 1;
+    /*auto x_searches = r_w - N + 1;*/
     auto y_searches = r_h - N + 1;
 
     for (size_t y = 1; y < y_searches; y++) {
+        uint16_t start = start_end[y * 2 + 0];
+        uint16_t end = start_end[y * 2 + 1];
+
         auto inner = [&](size_t needle_y) {
-            for (size_t x = 1; x < x_searches; x++) {
+            for (size_t x = start; x < end; x++) {
                 auto r = &reference[(y + needle_y) * r_w + x];
                 auto n = &needle_u8[needle_y * N];
                 uint32_t acc_ = 0;
@@ -207,14 +202,18 @@ extern "C" size_t ncc_8_u8(
                 }
             }
         };
+
         inner(0);
         for (size_t needle_y = 1; needle_y < n_h; needle_y++) {
             inner(needle_y);
         }
 
-        for (size_t x = 1; x < x_searches; x++) {
+        // check num > threshold_d * den, not 100% sure this is numerically accurate
+        // is maybe 1% faster
+#define SCALED_COMPARE
+
+        for (size_t x = start; x < end; x++) {
             uint32_t acc_ = acc[x - 1];
-            /*uint32_t s_p = ncc_sum_table_sum(sum_table, r_w, x, y, n_w, n_h);*/
             uint32_t s_p = patch_sum[y * r_w + x];
             if (s_p == 0) {
                 continue;
@@ -224,23 +223,26 @@ extern "C" size_t ncc_8_u8(
                 continue;
             }
             double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) / (double)n;
-            /*if (num < 0) {*/
-            /*    continue;*/
-            /*}*/
-            /*uint64_t s2_p = ncc_sumsqr_table_sum(sumsqr_table, r_w, x, y, n_w, n_h);*/
-            /*double norm2_p = (double)s2_p - (double)((uint64_t)s_p * (uint64_t)s_p) / (double)n;*/
-            double norm2_p = patch_norm[y * r_w + x];
-            double den = sqrt(norm2_n * norm2_p);
+
+            double norm_p = patch_norm[y * r_w + x];
+            double den = norm_n * norm_p;
+#ifdef SCALED_COMPARE
+#else
             double similarity = num / den;
+#endif
             /*if (!(similarity >= -1.01 && similarity <= 1.01)) {*/
             /*    fprintf(stderr, "bad similarity %.2f; x=%ld y=%ld norm_2n=%f norm_2p=%f acc=%d num=%f s_n=%d s_p=%d\n",*/
             /*            similarity, x, y, norm2_n, norm2_p, acc_, num, s_n, s_p*/
             /*            );*/
             /*}*/
             /*assert(similarity >= -1.01 && similarity <= 1.01);*/
-            /*fprintf(stderr, "similarity %.2f\n", similarity);*/
-            if (similarity > threshold) {
+#ifdef SCALED_COMPARE
+            if (num > threshold_d * den) {
+                *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)(num / den)};
+#else
+            if (similarity > threshold_d) {
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)similarity};
+#endif
                 n_written += 1;
                 if (out_cur == out_fin) {
                     return n_written;
