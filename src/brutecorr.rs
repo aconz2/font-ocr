@@ -16,6 +16,8 @@ const DEFAULT_ALPHABET: &str =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=+(){};:/_-";
 //"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+const MAX_MATCHES: usize = 1024;
+
 #[derive(Clone, Copy)]
 enum BoxSize {
     Font,
@@ -71,7 +73,7 @@ impl From<MatchC> for Match {
 }
 
 unsafe extern "C" {
-    fn ncc_8(
+    fn ncc_8_f32(
         reference: *const f32,
         r_w: usize,
         r_h: usize,
@@ -81,8 +83,25 @@ unsafe extern "C" {
         needle_f: *const f32,
         n_w: usize,
         n_h: usize,
-        mask: *const f32,
         acc: *mut u32,
+        threshold: f32,
+        out: *mut MatchC,
+        n_out: usize,
+        ) -> usize;
+
+    fn ncc_8_u8(
+        reference: *const u8,
+        r_w: usize,
+        r_h: usize,
+        sum_table: *const u32,
+        sumsqr_table: *const u64,
+        needle: *const u8,
+        needle_u8: *const u8,
+        n_w: usize,
+        n_h: usize,
+        acc: *mut u32,
+        patch_sum: *const u32,
+        patch_norm: *const f64,
         threshold: f32,
         out: *mut MatchC,
         n_out: usize,
@@ -92,6 +111,7 @@ unsafe extern "C" {
 #[derive(Clone, Copy, Debug)]
 struct MatchWithBaseline {
     rect: RectI,
+    #[allow(unused)]
     similarity: f32,
     baseline: f32,
 }
@@ -102,13 +122,19 @@ type SumTableT = u32;
 type SumSqrTableT = u64;
 
 struct Searcher {
-    reference: Array2<PixelType>,
+    reference_f32: Array2<f32>,
+    reference_u8: Array2<u8>,
+    patch_sum: Array2<SumTableT>,
+    patch_norm: Array2<f64>,
     sum_table: Array2<SumTableT>,
     sumsqr_table: Array2<SumSqrTableT>,
-    acc: Vec<AccType>,
-    needle: Vec<PixelType>,
+    //acc_f32: Vec<f32>,
+    acc_u32: Vec<u32>,
+    needle_f32: Vec<f32>,
+    needle_u8: Vec<u8>,
     matches: Vec<Match>,
     matches_c: Vec<MatchC>,
+    last_patch_size: Option<Vector2I>,
 }
 
 fn render(
@@ -288,40 +314,145 @@ fn ncc_sumsqr_table_sum(s: &Array2<SumSqrTableT>, (x, y): (usize, usize), (w, h)
 
 impl Searcher {
     fn new(img: &GrayImage) -> Searcher {
-        let reference = image_to_u8(img);
-        let sum_table = ncc_sum_table(&reference);
-        let sumsqr_table = ncc_sumsqr_table(&reference);
-        let reference = image_to_f32(img);
+        let reference_u8 = image_to_u8(img);
+        let sum_table = ncc_sum_table(&reference_u8);
+        let sumsqr_table = ncc_sumsqr_table(&reference_u8);
+        let reference_f32 = image_to_f32(img);
+        let patch_sum = Array2::new(img.height() as usize, img.width() as usize);
+        let patch_norm = Array2::new(img.height() as usize, img.width() as usize);
 
         let matches = Vec::with_capacity(1024);
-        let matches_c = Vec::with_capacity(1024);
-        let acc = vec![AccType::default(); img.width() as usize];
-        let needle = vec![PixelType::default(); 128];
+        let matches_c = vec![MatchC::default(); MAX_MATCHES];
+        let acc_u32 = vec![0; img.width() as usize];
+        let needle_f32 = vec![0.; 128];
+        let needle_u8 = vec![0; 128];
+        let last_patch_size = None;
 
         Searcher {
-            reference,
+            reference_f32,
+            reference_u8,
             sum_table,
             sumsqr_table,
-            needle,
-            acc,
+            needle_u8,
+            needle_f32,
+            acc_u32,
             matches,
             matches_c,
+            last_patch_size,
+            patch_sum,
+            patch_norm,
         }
     }
 
-    fn search(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+    fn prepare_for_size(&mut self, size: Vector2I) {
+        if let Some(s) = self.last_patch_size {
+            if s == size {
+                return;
+            }
+        }
+
+        let n_h = size.y() as usize;
+        let n_w = size.x() as usize;
+        let n = n_h * n_w;
+
+        let (r_w, r_h) = (self.reference_f32.cols, self.reference_f32.rows);
+
+        let x_searches = r_w - n_w + 1;
+        let y_searches = r_h - n_h + 1;
+
+        for y in 1..y_searches {
+            for x in 1..x_searches {
+                let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
+                let s2_p = ncc_sumsqr_table_sum(&self.sumsqr_table, (x, y), (n_w, n_h));
+                let norm = s2_p as f64 - ((s_p as u64 * s_p as u64) as f64) / n as f64;
+                self.patch_sum[(x, y)] = s_p;
+                self.patch_norm[(x, y)] = norm;
+            }
+        }
+
+        self.last_patch_size = Some(size);
+    }
+
+    fn search_f32(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+        self.prepare_for_size(size);
         let w = size.x();
         if w <= 8 {
-            self.search_n::<8>(needle, size, threshold)
+            self.search_n_f32::<8>(needle, size, threshold)
         } else if w <= 16 {
             // TODO this isn't generating avx2 for some reason
-            self.search_n::<16>(needle, size, threshold)
+            self.search_n_f32::<16>(needle, size, threshold)
         } else {
             todo!()
         }
     }
 
-    fn search_c(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+    fn search_u8(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+        self.prepare_for_size(size);
+        let w = size.x();
+        if w <= 8 {
+            self.search_n_u8::<8>(needle, size, threshold)
+        } else if w <= 16 {
+            // TODO this isn't generating avx2 for some reason
+            self.search_n_u8::<16>(needle, size, threshold)
+        } else {
+            todo!()
+        }
+    }
+
+    fn search_c_u8(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+        self.prepare_for_size(size);
+        let n_h = size.y() as usize;
+        let n_w = size.x() as usize;
+        if n_w <= 8 {
+            const N: usize = 8;
+            //let max_matches = 1024;
+            //self.matches_c.resize(max_matches, MatchC::default());
+
+            self.needle_u8.resize(N * n_h as usize, 0);
+            {
+                let (rows, _rem) = self.needle_u8.as_chunks_mut::<N>();
+                copy_needle_n_u8(rows, needle, size);
+            }
+
+            let x_searches = self.reference_f32.cols - N + 1;
+            self.acc_u32.fill(0);
+            self.acc_u32.resize(x_searches - 1, 0);
+            let n_matches = unsafe {
+                ncc_8_u8(
+                    self.reference_u8.data.as_ptr(),
+                    self.reference_u8.cols,
+                    self.reference_u8.rows,
+                    self.sum_table.data.as_ptr(),
+                    self.sumsqr_table.data.as_ptr(),
+                    needle.as_ptr(),
+                    self.needle_u8.as_ptr(),
+                    n_w,
+                    n_h,
+                    self.acc_u32.as_mut_ptr(),
+                    self.patch_sum.data.as_ptr(),
+                    self.patch_norm.data.as_ptr(),
+                    threshold,
+                    self.matches_c.as_mut_ptr(),
+                    self.matches_c.len(),
+                    )
+            };
+            if n_matches == MAX_MATCHES {
+                eprintln!("WARN got >= {n_matches} matches");
+            }
+            //self.matches_c.resize(n_matches, MatchC::default());
+            self.matches.clear();
+            for m in self.matches_c.iter().take(n_matches) {
+                self.matches.push((*m).into());
+            }
+            &self.matches
+        } else {
+            todo!()
+        }
+    }
+
+
+    fn search_c_f32(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+        self.prepare_for_size(size);
         let n_h = size.y() as usize;
         let n_w = size.x() as usize;
         if n_w <= 8 {
@@ -329,29 +460,27 @@ impl Searcher {
             let max_matches = 1024;
             self.matches_c.resize(max_matches, MatchC::default());
 
-            self.needle.resize(N * n_h as usize, PixelType::default());
+            self.needle_f32.resize(N * n_h as usize, PixelType::default());
             {
-                let (rows, _rem) = self.needle.as_chunks_mut::<N>();
+                let (rows, _rem) = self.needle_f32.as_chunks_mut::<N>();
                 copy_needle_n_f32(rows, needle, size);
             }
-            let mask = get_mask_n_f32::<N>(n_w);
 
-            let x_searches = self.reference.cols - N + 1;
-            self.acc.fill(AccType::default());
-            self.acc.resize(x_searches - 1, AccType::default());
+            let x_searches = self.reference_f32.cols - N + 1;
+            self.acc_u32.fill(0);
+            self.acc_u32.resize(x_searches - 1, 0);
             let n_matches = unsafe {
-                ncc_8(
-                    self.reference.data.as_ptr(),
-                    self.reference.cols,
-                    self.reference.rows,
+                ncc_8_f32(
+                    self.reference_f32.data.as_ptr(),
+                    self.reference_f32.cols,
+                    self.reference_f32.rows,
                     self.sum_table.data.as_ptr(),
                     self.sumsqr_table.data.as_ptr(),
                     needle.as_ptr(),
-                    self.needle.as_ptr(),
+                    self.needle_f32.as_ptr(),
                     n_w,
                     n_h,
-                    mask.as_ptr(),
-                    self.acc.as_mut_ptr(),
+                    self.acc_u32.as_mut_ptr(),
                     threshold,
                     self.matches_c.as_mut_ptr(),
                     self.matches_c.len(),
@@ -375,7 +504,7 @@ impl Searcher {
     // and because the needle is padded up to N, we won't search the last N - needle.width()
     // cols
     #[inline(never)]
-    fn search_n<const N: usize>(
+    fn search_n_f32<const N: usize>(
         &mut self,
         needle: &[u8],
         size: Vector2I,
@@ -387,7 +516,7 @@ impl Searcher {
         let n_h = size.y() as usize;
         let n_w = size.x() as usize;
 
-        let (r_w, r_h) = (self.reference.cols, self.reference.rows);
+        let (r_w, r_h) = (self.reference_f32.cols, self.reference_f32.rows);
 
         let x_searches = r_w - N + 1;
         let y_searches = r_h - n_h + 1;
@@ -395,16 +524,14 @@ impl Searcher {
         let mut min_sim = f32::INFINITY;
         let mut max_sim = -f32::INFINITY;
 
-        self.acc.fill(AccType::default());
-        self.acc.resize(x_searches - 1, AccType::default());
+        self.acc_u32.resize(x_searches - 1, AccType::default());
 
-        self.needle.resize(N * n_h as usize, PixelType::default());
+        self.needle_f32.resize(N * n_h as usize, PixelType::default());
         {
-            let (rows, _rem) = self.needle.as_chunks_mut::<N>();
+            let (rows, _rem) = self.needle_f32.as_chunks_mut::<N>();
             copy_needle_n_f32(rows, needle, size);
         }
-        let mask = get_mask_n_f32(n_w);
-        let (needle_buf, _rem) = self.needle.as_chunks::<N>();
+        let (needle_buf, _rem) = self.needle_f32.as_chunks::<N>();
 
         let n = n_w * n_h;
 
@@ -428,17 +555,110 @@ impl Searcher {
         for y in 1..y_searches {
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
 
-                let row = self.reference.get_row(y + needle_y);
+                let row = self.reference_f32.get_row(y + needle_y);
                 let ref_windows = row[1..].array_windows::<N>();
-                for (_x, (acc, ref_row)) in self.acc.iter_mut().zip(ref_windows).enumerate() {
+                for (x, (acc, ref_row)) in self.acc_u32.iter_mut().zip(ref_windows).enumerate() {
                     // x is offset by 1
-                    //*acc += cross_corr_n_u8(*needle_row, *ref_row, mask);
+                    let x = x + 1;
+                    if self.patch_sum[(x, y)] == 0 {
+                        continue;
+                    }
                     // we really want to accumulate into u32 b/c an f32 dot is only valid for
                     // templates of up to n=128 == 7 bits + 16 bits from 8bit * 8bit == 23 bits
-                    *acc += cross_corr_n_f32(*needle_row, *ref_row, mask) as u32;
+                    if needle_y == 0 {
+                        *acc = cross_corr_n_f32(*needle_row, *ref_row) as u32;
+                    } else {
+                        *acc += cross_corr_n_f32(*needle_row, *ref_row) as u32;
+                    }
                 }
             }
-            for (x, acc) in self.acc.iter().enumerate() {
+            for (x, acc) in self.acc_u32.iter().enumerate() {
+                // x is offset by 1
+                let x = x + 1;
+                //let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
+                let s_p = self.patch_sum[(x, y)];
+                let s2_p = ncc_sumsqr_table_sum(&self.sumsqr_table, (x, y), (n_w, n_h));
+                if s_p == 0 {
+                    continue;
+                }
+                let num = *acc as f64 - (s_n as u64 * s_p as u64) as f64 / n as f64;
+                if num < 0. {
+                    continue;
+                }
+                let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64 ) as f64 / n as f64;
+                let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64 ) as f64 / n as f64;
+                debug_assert!(norm2_n > 0.);
+                debug_assert!(norm2_p > 0.);
+                let den = (norm2_n * norm2_p).sqrt();
+                let similarity = (num as f64 / den) as f32;
+                debug_assert!(similarity >= -1.01 && similarity <= 1.01, "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}");
+                max_sim = f32::max(max_sim, similarity);
+                min_sim = f32::min(max_sim, similarity);
+                if similarity > threshold {
+                    let rect = RectI::new(
+                            Vector2I::new(x as i32, y as i32),
+                            Vector2I::new(n_w as i32, n_h as i32),
+                        );
+                    self.matches.push(Match { similarity, rect });
+                }
+            }
+        }
+        eprintln!("max sim {max_sim} min sim {min_sim}");
+        &self.matches
+    }
+
+    #[inline(never)]
+    fn search_n_u8<const N: usize>(
+        &mut self,
+        needle: &[u8],
+        size: Vector2I,
+        threshold: f32,
+    ) -> &[Match] {
+        assert!(size.x() <= N as i32);
+        self.matches.clear();
+
+        let n_h = size.y() as usize;
+        let n_w = size.x() as usize;
+
+        let (r_w, r_h) = (self.reference_f32.cols, self.reference_f32.rows);
+
+        let x_searches = r_w - N + 1;
+        let y_searches = r_h - n_h + 1;
+
+        let mut min_sim = f32::INFINITY;
+        let mut max_sim = -f32::INFINITY;
+
+        self.acc_u32.resize(x_searches - 1, AccType::default());
+
+        self.needle_u8.resize(N * n_h as usize, 0);
+        {
+            let (rows, _rem) = self.needle_u8.as_chunks_mut::<N>();
+            copy_needle_n_u8(rows, needle, size);
+        }
+        let (needle_buf, _rem) = self.needle_u8.as_chunks::<N>();
+
+        let n = n_w * n_h;
+
+        // sum_needle sumsqr_needle
+        let (s_n, s2_n) = image_sum_sumsqr(needle);
+        if s_n == 0 {
+            return &self.matches;
+        }
+
+        for y in 1..y_searches {
+            for (needle_y, needle_row) in needle_buf.iter().enumerate() {
+
+                let row = self.reference_u8.get_row(y + needle_y);
+                let ref_windows = row[1..].array_windows::<N>();
+                for (_x, (acc, ref_row)) in self.acc_u32.iter_mut().zip(ref_windows).enumerate() {
+                    if needle_y == 0 {
+                        *acc = cross_corr_n_u8(*needle_row, *ref_row) as u32;
+                    } else {
+                        *acc += cross_corr_n_u8(*needle_row, *ref_row) as u32;
+                    }
+                }
+            }
+            for (x, acc) in self.acc_u32.iter().enumerate() {
                 // x is offset by 1
                 let x = x + 1;
                 let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
@@ -467,7 +687,6 @@ impl Searcher {
                     self.matches.push(Match { similarity, rect });
                 }
             }
-            self.acc.fill(AccType::default());
         }
         eprintln!("max sim {max_sim} min sim {min_sim}");
         &self.matches
@@ -521,6 +740,9 @@ struct Args {
 
     #[arg(long)]
     c: bool,
+
+    #[arg(long)]
+    u8: bool,
 }
 
 fn main() {
@@ -684,10 +906,23 @@ fn main() {
                 let im = canvas_to_lum8(&canvas);
                 image::DynamicImage::ImageLuma8(im).save(format!("letters/{letter}-{x}_{y}.png")).unwrap();
             }
-            let hits = if args.c {
-                searcher.search_c(&needle, canvas.size, args.threshold)
+            if args.u8 {
+
             } else {
-                searcher.search(&needle, canvas.size, args.threshold)
+
+            }
+            let hits = if args.u8 {
+                if args.c {
+                    searcher.search_c_u8(&needle, canvas.size, args.threshold)
+                } else {
+                    searcher.search_u8(&needle, canvas.size, args.threshold)
+                }
+            } else {
+                if args.c {
+                    searcher.search_c_f32(&needle, canvas.size, args.threshold)
+                } else {
+                    searcher.search_f32(&needle, canvas.size, args.threshold)
+                }
             };
             let t1 = Instant::now();
             let _ = canvas_cache.insert(canvas);
@@ -759,6 +994,8 @@ fn main() {
     //eprintln!("hits: {n_hits} error per hit:{avg_error}");
     eprintln!("hits: {n_hits}");
 
+    let mut hits_by_char = hits_by_char.into_iter().collect::<Vec<_>>();
+    hits_by_char.sort_by_key(|(char, count)| (*count, *char));
     for (char, count) in hits_by_char {
         if count == 0 {
             continue;
@@ -866,18 +1103,18 @@ fn image_sum_sumsqr(pixels: &[u8]) -> (u32, u32) {
 //}
 //
 //
-//fn cross_corr_n_u8<const N: usize>(a: [u8; N], b: [u8; N], mask: [u8; N]) -> u32 {
-//    let mut ret = 0u32;
-//    for i in 0..N {
-//        ret += a[i] as u32 * b[i] as u32 * mask[i] as u32;
-//    }
-//    ret
-//}
+fn cross_corr_n_u8<const N: usize>(a: [u8; N], b: [u8; N]) -> u32 {
+    let mut ret = 0u32;
+    for i in 0..N {
+        ret += (a[i] as u16 * b[i] as u16) as u32;
+    }
+    ret
+}
 
-fn cross_corr_n_f32<const N: usize>(a: [f32; N], b: [f32; N], mask: [f32; N]) -> f32 {
+fn cross_corr_n_f32<const N: usize>(a: [f32; N], b: [f32; N]) -> f32 {
     let mut ret = 0f32;
     for i in 0..N {
-        ret += a[i] * b[i] * mask[i];
+        ret += a[i] * b[i];
     }
     ret
 }
@@ -890,39 +1127,26 @@ fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
     GrayImage::from_raw(w, h, pixels).unwrap()
 }
 
-//fn copy_needle_n_u8<const N: usize>(out: &mut [[u8; N]], needle: &[u8], size: Vector2I) {
-//    let w = size.x() as usize;
-//    for y in 0..(size.y() as usize) {
-//        for x in 0..(size.x() as usize) {
-//            out[y][x] = needle[y * w + x];
-//        }
-//    }
-//}
-
-fn copy_needle_n_f32<const N: usize>(out: &mut [[f32; N]], needle: &[u8], size: Vector2I) {
+fn copy_needle_n_u8<const N: usize>(out: &mut [[u8; N]], needle: &[u8], size: Vector2I) {
     let w = size.x() as usize;
     for y in 0..(size.y() as usize) {
-        for x in 0..(size.x() as usize) {
-            out[y][x] = needle[y * w + x] as f32;
+        for x in 0..w {
+            out[y][x] = needle[y * w + x];
+        }
+        for x in w..N {
+            out[y][x] = 0;
         }
     }
 }
 
-//fn get_mask_n_u8<const N: usize>(n: usize) -> [u8; N] {
-//    debug_assert!(n >= 1 && n <= N);
-//    let mut arr = [0; N];
-//    for i in 0..n {
-//        arr[i] = 1;
-//    }
-//    arr
-//}
-
-fn get_mask_n_f32<const N: usize>(n: usize) -> [f32; N] {
-    debug_assert!(n >= 1 && n <= N);
-    let mut arr = [0.; N];
-    for i in 0..n {
-        arr[i] = 1.;
+fn copy_needle_n_f32<const N: usize>(out: &mut [[f32; N]], needle: &[u8], size: Vector2I) {
+    let w = size.x() as usize;
+    for y in 0..(size.y() as usize) {
+        for x in 0..w {
+            out[y][x] = needle[y * w + x] as f32;
+        }
+        for x in w..N {
+            out[y][x] = 0.;
+        }
     }
-    arr
 }
-
