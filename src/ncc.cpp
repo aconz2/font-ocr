@@ -220,7 +220,8 @@ extern "C" size_t ncc_8_u8(
     auto y_searches = r_h - N + 1;
 
 // this is slower
-#define ALIGNR
+//
+#define BSLRI
 /*#define QUAD*/
     // delayed sum good
 /*#define DELAYED_SUM*/
@@ -230,22 +231,25 @@ extern "C" size_t ncc_8_u8(
         uint16_t start = start_end[y * 2 + 0];
         uint16_t end = start_end[y * 2 + 1];
 
-#ifdef ALIGNR
+#ifdef BSRLI
         auto inner = [&](size_t needle_y) {
             size_t x = start;
             __m128i windows[8];
             __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
             for (; x + N <= end; x += N) {
+                // this loads 16 elements, then we can shift them over
                 __m128i r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
 
                 windows[0] = r1;
-                windows[1] = _mm_alignr_epi8(r1, r1, 1);
-                windows[2] = _mm_alignr_epi8(r1, r1, 2);
-                windows[3] = _mm_alignr_epi8(r1, r1, 3);
-                windows[4] = _mm_alignr_epi8(r1, r1, 4);
-                windows[5] = _mm_alignr_epi8(r1, r1, 5);
-                windows[6] = _mm_alignr_epi8(r1, r1, 6);
-                windows[7] = _mm_alignr_epi8(r1, r1, 7);
+                // I was using alignr here but realized I was loading 16 bytes anyways
+                // so it became _mm_alignr_epi8(r1, r1, 1) and same as shifting
+                windows[1] = _mm_bsrli_si128(r1, 1);
+                windows[2] = _mm_bsrli_si128(r1, 2);
+                windows[3] = _mm_bsrli_si128(r1, 3);
+                windows[4] = _mm_bsrli_si128(r1, 4);
+                windows[5] = _mm_bsrli_si128(r1, 5);
+                windows[6] = _mm_bsrli_si128(r1, 6);
+                windows[7] = _mm_bsrli_si128(r1, 7);
                 if (needle_y == 0) {
                     for (size_t j = 0; j < 8; j++) {
                         acc[x + j] = u16v_8_dot(n, _mm_cvtepu8_epi16(windows[j]));
