@@ -145,6 +145,42 @@ extern "C" size_t ncc_8_f32(
     return n_written;
 }
 
+#define MANUAL_INTRIN
+
+#ifdef MANUAL_INTRIN
+static inline __m128i u16v_8_dot_v(__m128i a, __m128i b) {
+    // a b c d e f g h
+    // the madd gives us
+    // 0  1  2  3
+    // ab cd ef gh
+    // ef gh ab cd + <- shuffle
+    // abef cdgh efab ghcd
+    // 0    1    2    3
+    // abef cdgh efab ghcd + <- shuffle
+    // cdgh abef ghcd efab
+    __m128i x = _mm_madd_epi16(a, b);
+    x = _mm_add_epi32(x, _mm_shuffle_epi32(x, _MM_SHUFFLE(2, 3, 0, 1)));
+    x = _mm_add_epi32(x, _mm_shuffle_epi32(x, _MM_SHUFFLE(1, 0, 3, 2)));
+    return x;
+};
+static inline uint32_t u16v_8_dot(__m128i a, __m128i b) {
+    auto x = u16v_8_dot_v(a, b);
+    return _mm_cvtsi128_si32(x);
+}
+
+static inline uint32_t u8_8_dot_u(uint8_t* a, uint8_t* b) {
+    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)a));
+    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)b));
+    return u16v_8_dot(a_, b_);
+};
+
+static inline __m128i u8_8_dot_uv(uint8_t* a, uint8_t* b) {
+    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)a));
+    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)b));
+    return u16v_8_dot_v(a_, b_);
+};
+#endif
+
 extern "C" size_t ncc_8_u8(
     uint8_t* __restrict reference,
     size_t r_w,
@@ -183,56 +219,113 @@ extern "C" size_t ncc_8_u8(
     /*auto x_searches = r_w - N + 1;*/
     auto y_searches = r_h - N + 1;
 
-    // this is way faster
-#define MANUAL_INTRIN
+// this is slower
+/*#define ALIGNR*/
+#define QUAD
 
     for (size_t y = 1; y < y_searches; y++) {
         uint16_t start = start_end[y * 2 + 0];
         uint16_t end = start_end[y * 2 + 1];
 
+#ifdef ALIGNR
         auto inner = [&](size_t needle_y) {
-            for (size_t x = start; x < end; x++) {
-                auto r = &reference[(y + needle_y) * r_w + x];
+            size_t x = start;
+            __m128i windows[8];
+            __m128i n = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)&needle_u8[needle_y * N]));
+            __m128i r1, r2;
+            r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
+            for (; x + (N * 2) < end; x += N) {
+                r2 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + N]);
+
+                windows[0] = r1;
+                windows[1] = _mm_alignr_epi8(r2, r1, 1);
+                windows[2] = _mm_alignr_epi8(r2, r1, 2);
+                windows[3] = _mm_alignr_epi8(r2, r1, 3);
+                windows[4] = _mm_alignr_epi8(r2, r1, 4);
+                windows[5] = _mm_alignr_epi8(r2, r1, 5);
+                windows[6] = _mm_alignr_epi8(r2, r1, 6);
+                windows[7] = _mm_alignr_epi8(r2, r1, 7);
+                if (needle_y == 0) {
+                    for (size_t j = 0; j < 8; j++) {
+                        acc[x - 1 + j] = u16v_8_dot(n, _mm_cvtepu8_epi16(windows[j]));
+                    }
+                } else {
+                    for (size_t j = 0; j < 8; j++) {
+                        acc[x - 1 + j] += u16v_8_dot(n, _mm_cvtepu8_epi16(windows[j]));
+                    }
+                }
+                r1 = r2;
+            }
+            for (; x < end; x += 1) {
                 auto n = &needle_u8[needle_y * N];
-#ifdef MANUAL_INTRIN
-                __m128i n16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)n));
-                __m128i r16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)r));
-
-                // a b c d | e f g h
-                // the madd gives us
-                // 0  1    2  3
-                // ab cd | ef gh
-                // ef gh | ab cd + <- shuffle
-                // abef cdgh efab ghcd
-                // 0    1    2    3
-                // abef cdgh efab ghcd + <- shuffle
-                // cdgh abef ghcd efab
-                auto get_sum = [](__m128i m) {
-                    __m128i sum = _mm_add_epi32(m, _mm_shuffle_epi32(m, _MM_SHUFFLE(2, 3, 0, 1)));
-                    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
-                    return _mm_cvtsi128_si32(sum);
-                };
-
-                uint32_t acc_ = get_sum(_mm_madd_epi16(n16, r16));
-
+                auto r = &reference[(y + needle_y) * r_w + x];
+                uint32_t acc_ = u8_8_dot_u(n, r);
                 if (needle_y == 0) {
                     acc[x - 1] = acc_;
                 } else {
                     acc[x - 1] += acc_;
                 }
+            }
+        };
+#elif defined(QUAD)
+        auto inner = [&](size_t needle_y) {
+            auto n = &needle_u8[needle_y * N];
+            size_t x = start;
+            for (; x + 4 <= end; x += 4) {
+                __m128i a = _mm_loadu_si128((__m128i*)&acc[x-1]);
+                __m128i s1 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 0]);
+                __m128i s2 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 1]);
+                __m128i s3 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 2]);
+                __m128i s4 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 3]);
+#define BLEND
+#ifdef BLEND
+                // mask: 0 is first arg, 1 is second; read from right to left
+                __m128i s12 = _mm_blend_epi32(s1, s2, 0b0010); // [s1, s2, s1, s1]
+                __m128i s34 = _mm_blend_epi32(s3, s4, 0b1000); // [s3, s3, s3, s4]
+                __m128i s = _mm_blend_epi32(s12, s34, 0b1100); // [s1, s2, s3, s4]
+#else
+                __m128i s12 = _mm_unpacklo_epi32(s1, s2); // [S1, S2, S1, S2]
+                __m128i s34 = _mm_unpacklo_epi32(s3, s4); // [S3, S4, S3, S4]
+                __m128i s = _mm_unpacklo_epi64(s12, s34); // [S1, S2, S3, S4]
+#endif
+                if (needle_y == 0) {
+                    _mm_storeu_si128((__m128i*)&acc[x-1], s);
+                } else {
+                    a = _mm_add_epi32(a, s);
+                    _mm_storeu_si128((__m128i*)&acc[x-1], a);
+                }
+            }
+            for (; x < end; x += 1) {
+                auto r = &reference[(y + needle_y) * r_w + x];
+                uint32_t acc_ = u8_8_dot_u(n, r);
+                if (needle_y == 0) {
+                    acc[x - 1] = acc_;
+                } else {
+                    acc[x - 1] += acc_;
+                }
+            }
+        };
+#else
+        auto inner = [&](size_t needle_y) {
+            auto n = &needle_u8[needle_y * N];
+            for (size_t x = start; x < end; x++) {
+                auto r = &reference[(y + needle_y) * r_w + x];
+#ifdef MANUAL_INTRIN
+                uint32_t acc_ = u8_8_dot_u(n, r);
 #else
                 uint32_t acc_ = 0;
                 for (size_t i = 0; i < N; i++) {
                     acc_ += r[i] * n[i];
                 }
+#endif
                 if (needle_y == 0) {
                     acc[x - 1] = acc_;
                 } else {
                     acc[x - 1] += acc_;
                 }
-#endif
             }
         };
+#endif
 
         // doing two rows at once isn't faster
 /*#define DOUBLE*/
@@ -245,8 +338,12 @@ extern "C" size_t ncc_8_u8(
                 auto n1 = &needle_u8[needle_y * N];
                 auto n2 = &needle_u8[(needle_y + 1) * N];
                 uint32_t acc_ = 0;
+#ifdef MANUAL_INTRIN
+                acc_ = u8_8_dot_u(r1, n1) + u8_8_dot_u(r2, n2);
+#else
                 for (size_t i = 0; i < N; i++) { acc_ += r1[i] * n1[i]; }
                 for (size_t i = 0; i < N; i++) { acc_ += r2[i] * n2[i]; }
+#endif
                 if (needle_y == 0) {
                     acc[x - 1] = acc_;
                 } else {
