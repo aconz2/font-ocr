@@ -219,20 +219,21 @@ extern "C" size_t ncc_8_u8(
     /*auto x_searches = r_w - N + 1;*/
     auto y_searches = r_h - N + 1;
 
-// this is slower
-//
-#define BSLRI
-#define ALIGNR
-/*#define QUAD*/
+    // alignr is faster than bslri
     // delayed sum good
+
+/*#define BSLRI*/
+/*#define ALIGNR*/
+/*#define QUAD*/
 /*#define DELAYED_SUM*/
-/*#define DELAYED_SUM_ALIGNR*/
+#define DELAYED_SUM2
+/*#define DELAYED_SUM_BSLRI*/
 
     for (size_t y = 1; y < y_searches; y++) {
         uint16_t start = start_end[y * 2 + 0];
         uint16_t end = start_end[y * 2 + 1];
 
-#ifdef BSRLI
+#ifdef BSLRI
         auto inner = [&](size_t needle_y) {
             size_t x = start;
             __m128i windows[8];
@@ -328,25 +329,59 @@ extern "C" size_t ncc_8_u8(
                 }
             }
         };
-#elif defined(DELAYED_SUM_ALIGNR)
+#elif defined(DELAYED_SUM2)
+        auto inner = [&](size_t needle_y) {
+            __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
+            __m256i n = _mm256_set_m128i(n_8, n_8);
+            __m128i a;
+            size_t x = start;
+            for (; x + (N * 2) <= end; x += (N * 2)) {
+                for (size_t j = 0; j < N; j++) {
+                    __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
+                    __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
+                    __m128i nr1 = _mm256_extracti128_si256(nr, 0);
+                    __m128i nr2 = _mm256_extracti128_si256(nr, 1);
+                    auto a1 = &acc[(x + j) * 4];
+                    auto a2 = &acc[(x + N + j) * 4];
+                    if (needle_y == 0) {
+                        _mm_storeu_si128((__m128i*)a1, nr1);
+                        _mm_storeu_si128((__m128i*)a2, nr2);
+                    } else {
+                        a = _mm_add_epi32(nr1, _mm_loadu_si128((__m128i*)a1));
+                        _mm_storeu_si128((__m128i*)a1, a);
+                        a = _mm_add_epi32(nr2, _mm_loadu_si128((__m128i*)a2));
+                        _mm_storeu_si128((__m128i*)a2, a);
+                    }
+                }
+            }
+            for (; x < end; x++) {
+                __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
+                __m128i nr = _mm_madd_epi16(n_8, r); // 4 32 bit partial sums
+                if (needle_y == 0) {
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], nr);
+                } else {
+                    __m128i a = _mm_loadu_si128((__m128i*)&acc[x * 4]);
+                    a = _mm_add_epi32(a, nr);
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], a);
+                }
+            }
+        };
+#elif defined(DELAYED_SUM_BSLRI)
         auto inner = [&](size_t needle_y) {
             __m128i windows[8];
             __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
-            __m128i r1, r2;
             size_t x = start;
-            if (start + 1 == end) { return; }
-            r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
-            for (; x + (N * 2) <= end; x += N) {
-                r2 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + N]);
+            for (; x + N  <= end; x += N) {
+                __m128i r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
 
                 windows[0] = r1;
-                windows[1] = _mm_alignr_epi8(r2, r1, 1);
-                windows[2] = _mm_alignr_epi8(r2, r1, 2);
-                windows[3] = _mm_alignr_epi8(r2, r1, 3);
-                windows[4] = _mm_alignr_epi8(r2, r1, 4);
-                windows[5] = _mm_alignr_epi8(r2, r1, 5);
-                windows[6] = _mm_alignr_epi8(r2, r1, 6);
-                windows[7] = _mm_alignr_epi8(r2, r1, 7);
+                windows[1] = _mm_bsrli_si128(r1, 1);
+                windows[2] = _mm_bsrli_si128(r1, 2);
+                windows[3] = _mm_bsrli_si128(r1, 3);
+                windows[4] = _mm_bsrli_si128(r1, 4);
+                windows[5] = _mm_bsrli_si128(r1, 5);
+                windows[6] = _mm_bsrli_si128(r1, 6);
+                windows[7] = _mm_bsrli_si128(r1, 7);
                 if (needle_y == 0) {
                     for (size_t j = 0; j < 8; j++) {
                         __m128i v = _mm_madd_epi16(n, _mm_cvtepu8_epi16(windows[j]));
@@ -360,7 +395,6 @@ extern "C" size_t ncc_8_u8(
                         _mm_storeu_si128((__m128i*)&acc[(x + j) * 4], a);
                     }
                 }
-                r1 = r2;
             }
             for (; x < end; x++) {
                 __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
@@ -479,7 +513,7 @@ extern "C" size_t ncc_8_u8(
 #define SCALED_COMPARE
 
         for (size_t x = start; x < end; x++) {
-#ifdef DELAYED_SUM
+#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI
             uint32_t acc_ = 0;
             for (size_t i = 0; i < 4; i ++) {
                 acc_ += acc[(x * 4) + i];
