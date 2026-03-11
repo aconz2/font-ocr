@@ -169,14 +169,14 @@ static inline uint32_t u16v_8_dot(__m128i a, __m128i b) {
 }
 
 static inline uint32_t u8_8_dot_u(uint8_t* a, uint8_t* b) {
-    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)a));
-    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)b));
+    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)a));
+    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)b));
     return u16v_8_dot(a_, b_);
 };
 
 static inline __m128i u8_8_dot_uv(uint8_t* a, uint8_t* b) {
-    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)a));
-    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)b));
+    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)a));
+    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)b));
     return u16v_8_dot_v(a_, b_);
 };
 #endif
@@ -220,8 +220,11 @@ extern "C" size_t ncc_8_u8(
     auto y_searches = r_h - N + 1;
 
 // this is slower
-/*#define ALIGNR*/
-#define QUAD
+#define ALIGNR
+/*#define QUAD*/
+    // delayed sum good
+/*#define DELAYED_SUM*/
+/*#define DELAYED_SUM_ALIGNR*/
 
     for (size_t y = 1; y < y_searches; y++) {
         uint16_t start = start_end[y * 2 + 0];
@@ -231,10 +234,63 @@ extern "C" size_t ncc_8_u8(
         auto inner = [&](size_t needle_y) {
             size_t x = start;
             __m128i windows[8];
-            __m128i n = _mm_cvtepu8_epi16(_mm_loadl_epi64((__m128i*)&needle_u8[needle_y * N]));
+            __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
+            for (; x + N <= end; x += N) {
+                __m128i r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
+
+                windows[0] = r1;
+                windows[1] = _mm_alignr_epi8(r1, r1, 1);
+                windows[2] = _mm_alignr_epi8(r1, r1, 2);
+                windows[3] = _mm_alignr_epi8(r1, r1, 3);
+                windows[4] = _mm_alignr_epi8(r1, r1, 4);
+                windows[5] = _mm_alignr_epi8(r1, r1, 5);
+                windows[6] = _mm_alignr_epi8(r1, r1, 6);
+                windows[7] = _mm_alignr_epi8(r1, r1, 7);
+                if (needle_y == 0) {
+                    for (size_t j = 0; j < 8; j++) {
+                        acc[x + j] = u16v_8_dot(n, _mm_cvtepu8_epi16(windows[j]));
+                    }
+                } else {
+                    for (size_t j = 0; j < 8; j++) {
+                        acc[x + j] += u16v_8_dot(n, _mm_cvtepu8_epi16(windows[j]));
+                    }
+                }
+            }
+            for (; x < end; x += 1) {
+                auto n = &needle_u8[needle_y * N];
+                auto r = &reference[(y + needle_y) * r_w + x];
+                uint32_t acc_ = u8_8_dot_u(n, r);
+                if (needle_y == 0) {
+                    acc[x] = acc_;
+                } else {
+                    acc[x] += acc_;
+                }
+            }
+        };
+#elif defined(DELAYED_SUM)
+        auto inner = [&](size_t needle_y) {
+            __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
+            for (size_t x = start; x < end; x++) {
+                __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
+                __m128i nr = _mm_madd_epi16(n, r); // 4 32 bit partial sums
+                if (needle_y == 0) {
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], nr);
+                } else {
+                    __m128i a = _mm_loadu_si128((__m128i*)&acc[x * 4]);
+                    a = _mm_add_epi32(a, nr);
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], a);
+                }
+            }
+        };
+#elif defined(DELAYED_SUM_ALIGNR)
+        auto inner = [&](size_t needle_y) {
+            __m128i windows[8];
+            __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
             __m128i r1, r2;
+            size_t x = start;
+            if (start + 1 == end) { return; }
             r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
-            for (; x + (N * 2) < end; x += N) {
+            for (; x + (N * 2) <= end; x += N) {
                 r2 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + N]);
 
                 windows[0] = r1;
@@ -247,23 +303,28 @@ extern "C" size_t ncc_8_u8(
                 windows[7] = _mm_alignr_epi8(r2, r1, 7);
                 if (needle_y == 0) {
                     for (size_t j = 0; j < 8; j++) {
-                        acc[x - 1 + j] = u16v_8_dot(n, _mm_cvtepu8_epi16(windows[j]));
+                        __m128i v = _mm_madd_epi16(n, _mm_cvtepu8_epi16(windows[j]));
+                        _mm_storeu_si128((__m128i*)&acc[(x + j) * 4], v);
                     }
                 } else {
                     for (size_t j = 0; j < 8; j++) {
-                        acc[x - 1 + j] += u16v_8_dot(n, _mm_cvtepu8_epi16(windows[j]));
+                        __m128i a = _mm_loadu_si128((__m128i*)&acc[(x + j) * 4]);
+                        __m128i v = _mm_madd_epi16(n, _mm_cvtepu8_epi16(windows[j]));
+                        a = _mm_add_epi32(a, v);
+                        _mm_storeu_si128((__m128i*)&acc[(x + j) * 4], a);
                     }
                 }
                 r1 = r2;
             }
-            for (; x < end; x += 1) {
-                auto n = &needle_u8[needle_y * N];
-                auto r = &reference[(y + needle_y) * r_w + x];
-                uint32_t acc_ = u8_8_dot_u(n, r);
+            for (; x < end; x++) {
+                __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
+                __m128i nr = _mm_madd_epi16(n, r); // 4 32 bit partial sums
                 if (needle_y == 0) {
-                    acc[x - 1] = acc_;
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], nr);
                 } else {
-                    acc[x - 1] += acc_;
+                    __m128i a = _mm_loadu_si128((__m128i*)&acc[x * 4]);
+                    a = _mm_add_epi32(a, nr);
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], a);
                 }
             }
         };
@@ -272,7 +333,7 @@ extern "C" size_t ncc_8_u8(
             auto n = &needle_u8[needle_y * N];
             size_t x = start;
             for (; x + 4 <= end; x += 4) {
-                __m128i a = _mm_loadu_si128((__m128i*)&acc[x-1]);
+                __m128i a = _mm_loadu_si128((__m128i*)&acc[x]);
                 __m128i s1 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 0]);
                 __m128i s2 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 1]);
                 __m128i s3 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 2]);
@@ -289,19 +350,19 @@ extern "C" size_t ncc_8_u8(
                 __m128i s = _mm_unpacklo_epi64(s12, s34); // [S1, S2, S3, S4]
 #endif
                 if (needle_y == 0) {
-                    _mm_storeu_si128((__m128i*)&acc[x-1], s);
+                    _mm_storeu_si128((__m128i*)&acc[x], s);
                 } else {
                     a = _mm_add_epi32(a, s);
-                    _mm_storeu_si128((__m128i*)&acc[x-1], a);
+                    _mm_storeu_si128((__m128i*)&acc[x], a);
                 }
             }
             for (; x < end; x += 1) {
                 auto r = &reference[(y + needle_y) * r_w + x];
                 uint32_t acc_ = u8_8_dot_u(n, r);
                 if (needle_y == 0) {
-                    acc[x - 1] = acc_;
+                    acc[x] = acc_;
                 } else {
-                    acc[x - 1] += acc_;
+                    acc[x] += acc_;
                 }
             }
         };
@@ -319,9 +380,9 @@ extern "C" size_t ncc_8_u8(
                 }
 #endif
                 if (needle_y == 0) {
-                    acc[x - 1] = acc_;
+                    acc[x] = acc_;
                 } else {
-                    acc[x - 1] += acc_;
+                    acc[x] += acc_;
                 }
             }
         };
@@ -345,9 +406,9 @@ extern "C" size_t ncc_8_u8(
                 for (size_t i = 0; i < N; i++) { acc_ += r2[i] * n2[i]; }
 #endif
                 if (needle_y == 0) {
-                    acc[x - 1] = acc_;
+                    acc[x] = acc_;
                 } else {
-                    acc[x - 1] += acc_;
+                    acc[x] += acc_;
                 }
             }
         };
@@ -372,7 +433,14 @@ extern "C" size_t ncc_8_u8(
 #define SCALED_COMPARE
 
         for (size_t x = start; x < end; x++) {
-            uint32_t acc_ = acc[x - 1];
+#ifdef DELAYED_SUM
+            uint32_t acc_ = 0;
+            for (size_t i = 0; i < 4; i ++) {
+                acc_ += acc[(x * 4) + i];
+            }
+#else
+            uint32_t acc_ = acc[x];
+#endif
             uint32_t s_p = patch_sum[y * r_w + x];
             if (s_p == 0) {
                 continue;

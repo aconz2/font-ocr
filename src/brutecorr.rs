@@ -469,7 +469,7 @@ impl Searcher {
             }
 
             let x_searches = self.reference_f32.cols - N + 1;
-            self.acc_u32.resize((x_searches - 1) * 8, 0);
+            self.acc_u32.resize(x_searches * 4, 0);
 
             let n_matches = unsafe {
                 ncc_8_u8(
