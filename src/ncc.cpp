@@ -234,8 +234,8 @@ extern "C" size_t ncc_8_u8(
 /*#define SCALED_COMPARE*/
 
     for (size_t y = 1; y < y_searches; y++) {
-        uint16_t start = start_end[y * 2 + 0];
-        uint16_t end = start_end[y * 2 + 1];
+        const uint16_t start = start_end[y * 2 + 0];
+        const uint16_t end = start_end[y * 2 + 1];
 
 #ifdef BSLRI
         auto inner = [&](size_t needle_y) {
@@ -400,11 +400,12 @@ extern "C" size_t ncc_8_u8(
                 /*if (needle_y == 0 && y == 30) {*/
                 /*    fprintf(stderr, "DOUBLE SINGLE x=%ld acc_offset=%ld\n", x, x * 4);*/
                 /*}*/
+                auto a = acc + acc_offset;
                 if (needle_y == 0) {
-                    _mm_storeu_si128((__m128i*)&acc[acc_offset], nr);
+                    _mm_storeu_si128((__m128i*)a, nr);
                 } else {
-                    nr = _mm_add_epi32(nr, _mm_loadu_si128((__m128i*)&acc[acc_offset]));
-                    _mm_storeu_si128((__m128i*)&acc[acc_offset], nr);
+                    nr = _mm_add_epi32(nr, _mm_loadu_si128((__m128i*)a));
+                    _mm_storeu_si128((__m128i*)a, nr);
                 }
                 acc_offset += 4;
             }
@@ -560,6 +561,7 @@ extern "C" size_t ncc_8_u8(
 #else
             uint32_t acc_ = acc[acc_i];
 #endif
+
             uint32_t s_p = patch_sum[y * r_w + x];
             if (s_p == 0) {
                 return false;
@@ -572,14 +574,18 @@ extern "C" size_t ncc_8_u8(
             double den = norm_n * patch_norm[y * r_w + x];
 
 #ifdef SCALED_COMPARE
-#else
-            double similarity = num / den;
-#endif
-#ifdef SCALED_COMPARE
             if (num > threshold_d * den) {
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)(num / den)};
 #else
+            double similarity = num / den;
+            if (!std::isnan(similarity)) {
+                fprintf(stderr, "SUM y=%04ld x=%04ld acc=%ld s_p=%ld ni64=%ld sim=%6f\n", y, x, (uint64_t)acc_, (uint64_t)s_p, num_i64, similarity);
+            }
             if (similarity > threshold_d) {
+                if (x == 319 && y == 597) {
+                    fprintf(stderr, "YO WTF\n");
+                    exit(1);
+                }
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)similarity};
 #endif
                 return out_cur == out_fin;
@@ -590,6 +596,15 @@ extern "C" size_t ncc_8_u8(
 #ifdef DELAYED_SUM2_OOO
         size_t x = start;
         size_t acc_offset = 0;
+        /*if (y == 599) {*/
+        /*    for (size_t i = 0; i < r_w; i++) {*/
+        /*        uint32_t acc_ = 0;*/
+        /*        for (size_t j = 0; j < 4; j++) {*/
+        /*            acc_ += acc[(i * 4) + j];*/
+        /*        }*/
+        /*        fprintf(stderr, "SUM %ld\n", (uint64_t)acc_);*/
+        /*    }*/
+        /*}*/
         for (; x + (N * 2) < end; x += (N * 2)) {
             // process pairs
             for (size_t j = 0; j < N; j++) {
@@ -604,10 +619,10 @@ extern "C" size_t ncc_8_u8(
                 }
             }
         }
-        for (; x < end; x++) {
             /*if (y == 30) {*/
             /*    fprintf(stderr, "DOUBLE SUM SINGLE x=%ld acc_offset=%ld\n", x, x * 4);*/
             /*}*/
+        for (; x < end; x++) {
             if (process(acc_offset, x)) {
                 return n_out;
             }
@@ -631,5 +646,6 @@ extern "C" size_t ncc_8_u8(
 #endif // DELAYED_SUM2_OOO
     }
 
+    fprintf(stderr, "YO hits %ld\n", out_cur - out);
     return out_cur - out;
 }

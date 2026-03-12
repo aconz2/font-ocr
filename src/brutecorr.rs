@@ -664,8 +664,8 @@ impl Searcher {
         let x_searches = r_w - N + 1;
         let y_searches = r_h - n_h + 1;
 
-        let mut min_sim = f32::INFINITY;
-        let mut max_sim = -f32::INFINITY;
+        //let mut min_sim = f32::INFINITY;
+        //let mut max_sim = -f32::INFINITY;
 
         self.acc_u32.resize(x_searches - 1, AccType::default());
 
@@ -684,10 +684,14 @@ impl Searcher {
             return &self.matches;
         }
 
+
         for y in 1..y_searches {
+            let start = self.start_end[y * 2] as usize;
+            let end = self.start_end[y * 2 + 1] as usize;
+
             for (needle_y, needle_row) in needle_buf.iter().enumerate() {
                 let row = self.reference_u8.get_row(y + needle_y);
-                let ref_windows = row[1..].array_windows::<N>();
+                let ref_windows = row.array_windows::<N>().skip(start).take(end - start);
                 for (acc, ref_row) in self.acc_u32.iter_mut().zip(ref_windows) {
                     if needle_y == 0 {
                         *acc = cross_corr_n_u8(*needle_row, *ref_row);
@@ -696,9 +700,12 @@ impl Searcher {
                     }
                 }
             }
-            for (x, acc) in self.acc_u32.iter().enumerate() {
-                // x is offset by 1
-                let x = x + 1;
+            //if y == 599 {
+            //    for acc in self.acc_u32.iter() {
+            //        eprintln!("SUM {acc}");
+            //    }
+            //}
+            for (x, acc) in (start..end).zip(self.acc_u32.iter()) {
                 let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
                 let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
                 if s_p == 0 {
@@ -708,19 +715,24 @@ impl Searcher {
                 if num < 0. {
                     continue;
                 }
+                let num_i64 = n as i64 * *acc as i64 - s_n as i64 * s_p as i64;
                 let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64) as f64 / n as f64;
                 let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64) as f64 / n as f64;
                 debug_assert!(norm2_n > 0.);
                 debug_assert!(norm2_p > 0.);
                 let den = (norm2_n * norm2_p).sqrt();
+                let similarity_f64 = num as f64 / den;
+                if !similarity_f64.is_nan() {
+                    eprintln!("SUM y={y:04} x={x:04} acc={acc} s_p={s_p} ni64={num_i64} sim={similarity_f64:.6}");
+                }
                 let similarity = (num as f64 / den) as f32;
                 debug_assert!(
                     similarity >= -1.01 && similarity <= 1.01,
                     "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}"
                 );
-                max_sim = f32::max(max_sim, similarity);
-                min_sim = f32::min(max_sim, similarity);
-                if similarity > threshold {
+                //max_sim = f32::max(max_sim, similarity);
+                //min_sim = f32::min(max_sim, similarity);
+                if similarity_f64 > threshold as f64 {
                     let rect = RectI::new(
                         Vector2I::new(x as i32, y as i32),
                         Vector2I::new(n_w as i32, n_h as i32),
@@ -729,7 +741,7 @@ impl Searcher {
                 }
             }
         }
-        eprintln!("max sim {max_sim} min sim {min_sim}");
+        //eprintln!("max sim {max_sim} min sim {min_sim}");
         &self.matches
     }
 }
