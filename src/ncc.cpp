@@ -225,9 +225,13 @@ extern "C" size_t ncc_8_u8(
 /*#define ALIGNR*/
 /*#define QUAD*/
 /*#define DELAYED_SUM*/
-/*#define DELAYED_SUM2*/
-#define DELAYED_SUM2_OOO
+#define DELAYED_SUM2
+    // OOO produces slightly different output because of its ordering.. duh but then also different b/c we remove overlapping matches
+    // so the order matters for that
+/*#define DELAYED_SUM2_OOO*/
 /*#define DELAYED_SUM_BSLRI*/
+    // this is about the same as just delayed_sum
+/*#define DELAYED_SUM_ALIGNR*/
 
 // check num > threshold_d * den, not 100% sure this is numerically accurate
 // is maybe 1% faster
@@ -452,6 +456,52 @@ extern "C" size_t ncc_8_u8(
                 }
             }
         };
+#elif defined(DELAYED_SUM_ALIGNR)
+        auto inner = [&](size_t needle_y) {
+            __m128i windows[8];
+            __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
+            size_t x = start;
+            __m128i r1, r2, v;
+            r1 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
+            for (; x + N < end; x += N) {
+                r2 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x + N]));
+
+                windows[0] = r1;
+                windows[1] = _mm_alignr_epi8(r2, r1, 1 * 2);
+                windows[2] = _mm_alignr_epi8(r2, r1, 2 * 2);
+                windows[3] = _mm_alignr_epi8(r2, r1, 3 * 2);
+                windows[4] = _mm_alignr_epi8(r2, r1, 4 * 2);
+                windows[5] = _mm_alignr_epi8(r2, r1, 5 * 2);
+                windows[6] = _mm_alignr_epi8(r2, r1, 6 * 2);
+                windows[7] = _mm_alignr_epi8(r2, r1, 7 * 2);
+
+                if (needle_y == 0) {
+                    for (size_t j = 0; j < 8; j++) {
+                        auto a = &acc[(x + j) * 4];
+                        _mm_storeu_si128((__m128i*)a, _mm_madd_epi16(n, windows[j]));
+                    }
+                } else {
+                    for (size_t j = 0; j < 8; j++) {
+                        auto a = &acc[(x + j) * 4];
+                        v = _mm_loadu_si128((__m128i*)a);
+                        v = _mm_add_epi32(v, _mm_madd_epi16(n, windows[j]));
+                        _mm_storeu_si128((__m128i*)a, v);
+                    }
+                }
+                r1 = r2;
+            }
+            for (; x < end; x++) {
+                __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
+                __m128i nr = _mm_madd_epi16(n, r); // 4 32 bit partial sums
+                if (needle_y == 0) {
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], nr);
+                } else {
+                    __m128i a = _mm_loadu_si128((__m128i*)&acc[x * 4]);
+                    a = _mm_add_epi32(a, nr);
+                    _mm_storeu_si128((__m128i*)&acc[x * 4], a);
+                }
+            }
+        };
 #elif defined(QUAD)
         auto inner = [&](size_t needle_y) {
             auto n = &needle_u8[needle_y * N];
@@ -553,7 +603,7 @@ extern "C" size_t ncc_8_u8(
 #endif
 
         auto process = [&](size_t acc_i, size_t x) {
-#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2 || defined DELAYED_SUM2_OOO
+#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2 || defined DELAYED_SUM2_OOO || defined DELAYED_SUM_ALIGNR
             uint32_t acc_ = 0;
             for (size_t i = 0; i < 4; i ++) {
                 acc_ += acc[acc_i + i];
@@ -578,14 +628,7 @@ extern "C" size_t ncc_8_u8(
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)(num / den)};
 #else
             double similarity = num / den;
-            if (!std::isnan(similarity)) {
-                fprintf(stderr, "SUM y=%04ld x=%04ld acc=%ld s_p=%ld ni64=%ld sim=%6f\n", y, x, (uint64_t)acc_, (uint64_t)s_p, num_i64, similarity);
-            }
             if (similarity > threshold_d) {
-                if (x == 319 && y == 597) {
-                    fprintf(stderr, "YO WTF\n");
-                    exit(1);
-                }
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)similarity};
 #endif
                 return out_cur == out_fin;
@@ -596,22 +639,10 @@ extern "C" size_t ncc_8_u8(
 #ifdef DELAYED_SUM2_OOO
         size_t x = start;
         size_t acc_offset = 0;
-        /*if (y == 599) {*/
-        /*    for (size_t i = 0; i < r_w; i++) {*/
-        /*        uint32_t acc_ = 0;*/
-        /*        for (size_t j = 0; j < 4; j++) {*/
-        /*            acc_ += acc[(i * 4) + j];*/
-        /*        }*/
-        /*        fprintf(stderr, "SUM %ld\n", (uint64_t)acc_);*/
-        /*    }*/
-        /*}*/
         for (; x + (N * 2) < end; x += (N * 2)) {
             // process pairs
             for (size_t j = 0; j < N; j++) {
                 for (size_t i = 0; i < 2; i++) {
-                    /*if (y == 30) {*/
-                    /*    fprintf(stderr, "DOUBLE SUM i=%ld x=%ld acc_offset=%ld\n", i, x + j + 8 * i, acc_offset + 4 * i);*/
-                    /*}*/
                     if (process(acc_offset, x + j + 8 * i)) {
                         return n_out;
                     }
@@ -619,9 +650,6 @@ extern "C" size_t ncc_8_u8(
                 }
             }
         }
-            /*if (y == 30) {*/
-            /*    fprintf(stderr, "DOUBLE SUM SINGLE x=%ld acc_offset=%ld\n", x, x * 4);*/
-            /*}*/
         for (; x < end; x++) {
             if (process(acc_offset, x)) {
                 return n_out;
@@ -632,7 +660,7 @@ extern "C" size_t ncc_8_u8(
 
 
         for (size_t x = start; x < end; x++) {
-#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2
+#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2 || defined DELAYED_SUM_ALIGNR
             if (process((x * 4), x)) {
                 return n_out;
             }
@@ -646,6 +674,5 @@ extern "C" size_t ncc_8_u8(
 #endif // DELAYED_SUM2_OOO
     }
 
-    fprintf(stderr, "YO hits %ld\n", out_cur - out);
     return out_cur - out;
 }
