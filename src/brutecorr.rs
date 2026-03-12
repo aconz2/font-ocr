@@ -456,6 +456,7 @@ impl Searcher {
     }
 
     fn search_c_u8(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+        // TODO I think I need to prepare_for_size with the width as 8
         self.prepare_for_size(size);
         let n_h = size.y() as usize;
         let n_w = size.x() as usize;

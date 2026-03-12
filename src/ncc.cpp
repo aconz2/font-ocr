@@ -513,7 +513,7 @@ extern "C" size_t ncc_8_u8(
 #define SCALED_COMPARE
 
         for (size_t x = start; x < end; x++) {
-#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI
+#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2
             uint32_t acc_ = 0;
             for (size_t i = 0; i < 4; i ++) {
                 acc_ += acc[(x * 4) + i];
