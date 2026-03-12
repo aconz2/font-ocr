@@ -203,7 +203,6 @@ extern "C" size_t ncc_8_u8(
     Match* out_fin = out + n_out;
 
     size_t n = n_w * n_h;
-    size_t n_written = 0;
 
     uint32_t s_n = 0;
     uint32_t s2_n = 0;
@@ -226,8 +225,13 @@ extern "C" size_t ncc_8_u8(
 /*#define ALIGNR*/
 /*#define QUAD*/
 /*#define DELAYED_SUM*/
-#define DELAYED_SUM2
+/*#define DELAYED_SUM2*/
+#define DELAYED_SUM2_OOO
 /*#define DELAYED_SUM_BSLRI*/
+
+// check num > threshold_d * den, not 100% sure this is numerically accurate
+// is maybe 1% faster
+/*#define SCALED_COMPARE*/
 
     for (size_t y = 1; y < y_searches; y++) {
         uint16_t start = start_end[y * 2 + 0];
@@ -364,6 +368,45 @@ extern "C" size_t ncc_8_u8(
                     a = _mm_add_epi32(a, nr);
                     _mm_storeu_si128((__m128i*)&acc[x * 4], a);
                 }
+            }
+        };
+#elif defined(DELAYED_SUM2_OOO)
+        auto inner = [&](size_t needle_y) {
+            __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
+            __m256i n = _mm256_set_m128i(n_8, n_8);
+            size_t x = start;
+            size_t acc_offset = 0;
+            // acc gets pairs of 4 partial sums from (x, x+8) in a row, then the tail handling is as is
+            for (; x + (N * 2) < end; x += (N * 2)) {
+                for (size_t j = 0; j < N; j++) {
+                    __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
+                    __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
+                    auto a = acc + acc_offset;
+                    /*if (needle_y == 0 && y == 30) {*/
+                    /*    fprintf(stderr, "DOUBLE x=%ld,%ld acc_offset=%ld,%ld\n", x + j, x + j + 8, acc_offset, acc_offset + 4);*/
+                    /*}*/
+                    if (needle_y == 0) {
+                        _mm256_storeu_si256((__m256i*)a, nr);
+                    } else {
+                        nr = _mm256_add_epi32(nr, _mm256_loadu_si256((__m256i*)a));
+                        _mm256_storeu_si256((__m256i*)a, nr);
+                    }
+                    acc_offset += 8;
+                }
+            }
+            for (; x < end; x++) {
+                __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
+                __m128i nr = _mm_madd_epi16(n_8, r); // 4 32 bit partial sums
+                /*if (needle_y == 0 && y == 30) {*/
+                /*    fprintf(stderr, "DOUBLE SINGLE x=%ld acc_offset=%ld\n", x, x * 4);*/
+                /*}*/
+                if (needle_y == 0) {
+                    _mm_storeu_si128((__m128i*)&acc[acc_offset], nr);
+                } else {
+                    nr = _mm_add_epi32(nr, _mm_loadu_si128((__m128i*)&acc[acc_offset]));
+                    _mm_storeu_si128((__m128i*)&acc[acc_offset], nr);
+                }
+                acc_offset += 4;
             }
         };
 #elif defined(DELAYED_SUM_BSLRI)
@@ -508,41 +551,30 @@ extern "C" size_t ncc_8_u8(
         }
 #endif
 
-        // check num > threshold_d * den, not 100% sure this is numerically accurate
-        // is maybe 1% faster
-#define SCALED_COMPARE
-
-        for (size_t x = start; x < end; x++) {
-#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2
+        auto process = [&](size_t acc_i, size_t x) {
+#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2 || defined DELAYED_SUM2_OOO
             uint32_t acc_ = 0;
             for (size_t i = 0; i < 4; i ++) {
-                acc_ += acc[(x * 4) + i];
+                acc_ += acc[acc_i + i];
             }
 #else
-            uint32_t acc_ = acc[x];
+            uint32_t acc_ = acc[acc_i];
 #endif
             uint32_t s_p = patch_sum[y * r_w + x];
             if (s_p == 0) {
-                continue;
+                return false;
             }
             int64_t num_i64 = (int64_t)n * (int64_t)acc_ - ((int64_t)s_n * (int64_t)s_p);
             if (num_i64 < 0) {
-                continue;
+                return false;
             }
             double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) / (double)n;
+            double den = norm_n * patch_norm[y * r_w + x];
 
-            double norm_p = patch_norm[y * r_w + x];
-            double den = norm_n * norm_p;
 #ifdef SCALED_COMPARE
 #else
             double similarity = num / den;
 #endif
-            /*if (!(similarity >= -1.01 && similarity <= 1.01)) {*/
-            /*    fprintf(stderr, "bad similarity %.2f; x=%ld y=%ld norm_2n=%f norm_2p=%f acc=%d num=%f s_n=%d s_p=%d\n",*/
-            /*            similarity, x, y, norm2_n, norm2_p, acc_, num, s_n, s_p*/
-            /*            );*/
-            /*}*/
-            /*assert(similarity >= -1.01 && similarity <= 1.01);*/
 #ifdef SCALED_COMPARE
             if (num > threshold_d * den) {
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)(num / den)};
@@ -550,13 +582,54 @@ extern "C" size_t ncc_8_u8(
             if (similarity > threshold_d) {
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)similarity};
 #endif
-                n_written += 1;
-                if (out_cur == out_fin) {
-                    return n_written;
+                return out_cur == out_fin;
+            }
+            return false;
+        };
+
+#ifdef DELAYED_SUM2_OOO
+        size_t x = start;
+        size_t acc_offset = 0;
+        for (; x + (N * 2) < end; x += (N * 2)) {
+            // process pairs
+            for (size_t j = 0; j < N; j++) {
+                for (size_t i = 0; i < 2; i++) {
+                    /*if (y == 30) {*/
+                    /*    fprintf(stderr, "DOUBLE SUM i=%ld x=%ld acc_offset=%ld\n", i, x + j + 8 * i, acc_offset + 4 * i);*/
+                    /*}*/
+                    if (process(acc_offset, x + j + 8 * i)) {
+                        return n_out;
+                    }
+                    acc_offset += 4;
                 }
             }
         }
+        for (; x < end; x++) {
+            /*if (y == 30) {*/
+            /*    fprintf(stderr, "DOUBLE SUM SINGLE x=%ld acc_offset=%ld\n", x, x * 4);*/
+            /*}*/
+            if (process(acc_offset, x)) {
+                return n_out;
+            }
+            acc_offset += 4;
+        }
+#else
+
+
+        for (size_t x = start; x < end; x++) {
+#if defined DELAYED_SUM || defined DELAYED_SUM_BSLRI || defined DELAYED_SUM2
+            if (process((x * 4), x)) {
+                return n_out;
+            }
+#else
+            if (process(x, x)) {
+                return n_out;
+            }
+#endif
+
+        }
+#endif // DELAYED_SUM2_OOO
     }
 
-    return n_written;
+    return out_cur - out;
 }

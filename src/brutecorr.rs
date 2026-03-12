@@ -349,7 +349,8 @@ impl Searcher {
 
         let matches = Vec::with_capacity(1024);
         let matches_c = vec![MatchC::default(); MAX_MATCHES];
-        let acc_u32 = vec![0; img.width() as usize];
+        // big enough to keep 4 partial sums
+        let acc_u32 = vec![0; img.width() as usize * 4];
         let needle_f32 = vec![0.; 128];
         let needle_u8 = vec![0; 128];
         let last_patch_size = None;
@@ -468,9 +469,6 @@ impl Searcher {
                 let (rows, _rem) = self.needle_u8.as_chunks_mut::<N>();
                 copy_needle_n_u8(rows, needle, size);
             }
-
-            let x_searches = self.reference_f32.cols - N + 1;
-            self.acc_u32.resize(x_searches * 4, 0);
 
             let n_matches = unsafe {
                 ncc_8_u8(
@@ -983,7 +981,8 @@ fn main() {
                 let ul = hit.rect.origin();
                 let pt = hit.rect.to_f32().center();
                 println!(
-                    "{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{}",
+                    letter as usize,
                     pt.x(),
                     pt.y(),
                     ul.x(),
