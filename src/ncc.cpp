@@ -629,7 +629,7 @@ extern "C" size_t ncc_8_u8(
 
 #ifdef SCALED_COMPARE
             if (num > threshold_d * den) {
-                *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)(num / den)};
+                *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)(num / den)};
 #else
             double similarity = num / den;
             if (similarity > threshold_d) {
@@ -647,6 +647,7 @@ extern "C" size_t ncc_8_u8(
             // process pairs
             for (size_t j = 0; j < N; j++) {
                 for (size_t i = 0; i < 2; i++) {
+                    // annotating this [[unlikely]] makes it worse...
                     if (process(acc_offset, x + j + 8 * i)) {
                         return n_out;
                     }
