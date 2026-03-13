@@ -246,6 +246,8 @@ extern "C" size_t ncc_8_u8(
     // OOO produces slightly different output because of its ordering.. duh but then also different b/c we remove overlapping matches
     // so the order matters for that
 #define DELAYED_SUM2_OOO
+    // process_batched fixes the ordering of the OOO and is super fast
+#define PROCESS_BATCHED
 /*#define DELAYED_SUM_BSLRI*/
     // this is about the same as just delayed_sum
 /*#define DELAYED_SUM_ALIGNR*/
@@ -647,7 +649,6 @@ extern "C" size_t ncc_8_u8(
             return false;
         };
 
-#define PROCESS_BATCHED
 #ifdef DELAYED_SUM2_OOO
         size_t x = start;
         size_t acc_offset = 0;
@@ -661,7 +662,7 @@ extern "C" size_t ncc_8_u8(
             acc_offset += 8 * 8;
 
             // we want to shuffle these into 4 32bit sums to then expand into doubles in order
-            // these diagrams are mirrored
+            // these diagrams are mirrored from lane layout
             // each digit is the 32 bit sum
             // 0000,8888 1111,9999 2222,AAAA 3333,BBBB -> 0123,xxxx 89AB,xxxx -> 0x1x,2x3x 8x9x,AxBx
             // 0000,8888 1111,9999 2222,AAAA 3333,BBBB -> 0819,xxxx 2A3B,xxxx -> 0x8x,1x9x 2xAx,3xBx
@@ -686,20 +687,19 @@ extern "C" size_t ncc_8_u8(
             __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
             __m256d vthreshold = _mm256_set1_pd(threshold);
 
-            auto comp = [vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p) {
+            auto processv = [&out_cur, y, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x) {
                 // acc - s_p * s_n * (1 / n)
                 /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
                 __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc);
                 // (1 / norm_n) * (1 / norm_patch)
                 __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
                 __m256d sim = _mm256_mul_pd(num, den);
-                return _mm256_movemask_pd(_mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ));
-            };
-
-            auto processMask = [&out_cur, out_fin, y](int mask, size_t x) {
+                int mask = _mm256_movemask_pd(_mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ));
+                if (mask == 0) return false; // fast path for no hits
                 for (size_t i = 0; i < 4; i++) {
                     if ((1 << i) & mask) {
-                        *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, 1.0}; // TODO hard(er) to return the similarity
+                        float sim_ = sim[i]; // TIL you can index into the lane
+                        *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, sim_};
                         if (out_cur == out_fin) {
                             return true;
                         }
@@ -726,14 +726,11 @@ extern "C" size_t ncc_8_u8(
             __m256d vCDEF_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x + 12]));
             __m256d vCDEF_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x + 12]);
 
-            int mask0123 = comp(v0123_d, v0123_s_p, v0123_rn_p);
-            int mask4567 = comp(v4567_d, v4567_s_p, v4567_rn_p);
-            int mask89AB = comp(v89AB_d, v89AB_s_p, v89AB_rn_p);
-            int maskCDEF = comp(vCDEF_d, vCDEF_s_p, vCDEF_rn_p);
-            if (processMask(mask0123, x)) { return n_out; }
-            if (processMask(mask4567, x + 4)) { return n_out; }
-            if (processMask(mask89AB, x + 8)) { return n_out; }
-            if (processMask(maskCDEF, x + 12)) { return n_out; }
+            if (processv(v0123_d, v0123_s_p, v0123_rn_p, x + 0)) { return n_out; }
+            if (processv(v4567_d, v4567_s_p, v4567_rn_p, x + 4)) { return n_out; }
+            if (processv(v89AB_d, v89AB_s_p, v89AB_rn_p, x + 8)) { return n_out; }
+            if (processv(vCDEF_d, vCDEF_s_p, vCDEF_rn_p, x + 12)) { return n_out; }
+
 #else
             // process pairs
             for (size_t j = 0; j < N; j++) {
