@@ -655,7 +655,7 @@ extern "C" size_t ncc_8_u8(
 #ifdef PROCESS_BATCHED
             __m256i W[8];
             for (size_t i = 0; i < 8; i++) {
-                W[i] = u32_4_2_sum(_mm256_load_si256((__m256i*)acc + acc_offset + i * 8));
+                W[i] = u32_4_2_sum(_mm256_load_si256((__m256i*)&acc[acc_offset + i * 8]));
             }
             // W now holds acc sums in lo-hi lane pairs for 0,8 1,9 2,10 ... 7,15
             acc_offset += 8 * 8;
@@ -681,16 +681,17 @@ extern "C" size_t ncc_8_u8(
                 *v89AB_d = _mm256_cvtepi32_pd(_mm256_extractf128_si256(v0123_89AB, 1));
             };
 
-            __m256d s_nd = _mm256_set1_pd((double)s_n); // sum of needle double
+            __m256d vs_n = _mm256_set1_pd((double)s_n); // sum of needle double
             __m256d vn_recip = _mm256_set1_pd(n_recip); // n recip
             __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
             __m256d vthreshold = _mm256_set1_pd(threshold);
 
-            auto comp = [s_nd, vn_recip, vrnorm_n, vthreshold](__m256d v_acc, __m256d v_s_p, __m256d v_rn_p) {
+            auto comp = [vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p) {
                 // acc - s_p * s_n * (1 / n)
-                __m256d num = _mm256_sub_pd(v_acc, _mm256_mul_pd(_mm256_mul_pd(s_nd, v_s_p), v_rn_p));
+                /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
+                __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc);
                 // (1 / norm_n) * (1 / norm_patch)
-                __m256d den = _mm256_mul_pd(vrnorm_n, v_rn_p);
+                __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
                 __m256d sim = _mm256_mul_pd(num, den);
                 return _mm256_movemask_pd(_mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ));
             };
@@ -698,7 +699,7 @@ extern "C" size_t ncc_8_u8(
             auto processMask = [&out_cur, out_fin, y](int mask, size_t x) {
                 for (size_t i = 0; i < 4; i++) {
                     if ((1 << i) & mask) {
-                        *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, 1.0}; // TODO hard to return the similarity
+                        *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, 1.0}; // TODO hard(er) to return the similarity
                         if (out_cur == out_fin) {
                             return true;
                         }
@@ -711,7 +712,7 @@ extern "C" size_t ncc_8_u8(
             //                         08    19    2A    3B
             unpack(&v0123_d, &v89AB_d, W[0], W[1], W[2], W[3]);
             //                         4C    5D    6E    7F
-            unpack(&v4567_d, &vCDEF_d, W[0], W[1], W[2], W[3]);
+            unpack(&v4567_d, &vCDEF_d, W[4], W[5], W[6], W[7]);
 
             __m256d v0123_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x]));
             __m256d v0123_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x]);
@@ -730,9 +731,9 @@ extern "C" size_t ncc_8_u8(
             int mask89AB = comp(v89AB_d, v89AB_s_p, v89AB_rn_p);
             int maskCDEF = comp(vCDEF_d, vCDEF_s_p, vCDEF_rn_p);
             if (processMask(mask0123, x)) { return n_out; }
-            if (processMask(mask4567, x)) { return n_out; }
-            if (processMask(mask89AB, x)) { return n_out; }
-            if (processMask(maskCDEF, x)) { return n_out; }
+            if (processMask(mask4567, x + 4)) { return n_out; }
+            if (processMask(mask89AB, x + 8)) { return n_out; }
+            if (processMask(maskCDEF, x + 12)) { return n_out; }
 #else
             // process pairs
             for (size_t j = 0; j < N; j++) {
