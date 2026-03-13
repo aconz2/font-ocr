@@ -108,7 +108,7 @@ unsafe extern "C" {
         n_h: usize,
         acc: *mut u32,
         patch_sum: *const u32,
-        patch_norm: *const f64,
+        patch_rnorm: *const f64,
         start_end: *const u16,
         threshold: f32,
         out: *mut MatchC,
@@ -133,7 +133,7 @@ struct Searcher {
     reference_f32: Array2<f32>,
     reference_u8: Array2<u8>,
     patch_sum: Array2<SumTableT>,
-    patch_norm: Array2<f64>,
+    patch_rnorm: Array2<f64>,
     sum_table: Array2<SumTableT>,
     sumsqr_table: Array2<SumSqrTableT>,
     acc_u32: Vec<u32>,
@@ -366,7 +366,7 @@ impl Searcher {
             matches_c,
             last_patch_size,
             patch_sum,
-            patch_norm,
+            patch_rnorm: patch_norm,
             start_end,
         }
     }
@@ -419,7 +419,7 @@ impl Searcher {
                 let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
                 let norm = s2_p as f64 - ((s_p as u64 * s_p as u64) as f64) / n as f64;
                 self.patch_sum[(x, y)] = s_p;
-                self.patch_norm[(x, y)] = norm.sqrt();
+                self.patch_rnorm[(x, y)] = 1. / norm.sqrt();
             }
             self.start_end[y * 2 + 0] = start.try_into().unwrap();
             self.start_end[y * 2 + 1] = end.try_into().unwrap();
@@ -479,7 +479,7 @@ impl Searcher {
                     n_h,
                     self.acc_u32.as_mut_ptr(),
                     self.patch_sum.data.as_ptr(),
-                    self.patch_norm.data.as_ptr(),
+                    self.patch_rnorm.data.as_ptr(),
                     self.start_end.as_ptr(),
                     threshold,
                     self.matches_c.as_mut_ptr(),
