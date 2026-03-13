@@ -10,7 +10,7 @@
 #endif
 
 struct Match {
-    uint32_t x, y, w, h;
+    uint32_t x, y;
     float similarity;
 };
 
@@ -133,7 +133,7 @@ extern "C" size_t ncc_8_f32(
             assert(similarity >= -1.01 && similarity <= 1.01);
             /*fprintf(stderr, "similarity %.2f\n", similarity);*/
             if (similarity > threshold) {
-                *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, similarity};
+                *out_cur++ = {(uint32_t)x, (uint32_t)y, similarity};
                 n_written += 1;
                 if (out_cur == out_fin) {
                     return n_written;
@@ -181,6 +181,14 @@ static inline __m128i u8_8_dot_uv(uint8_t* a, uint8_t* b) {
 };
 #endif
 
+static inline uintptr_t align_to(uintptr_t p, size_t N) {
+    return (p + N - 1) & ~(N - 1);
+}
+
+// requirements:
+//  acc has at least 64 extra bytes so we can align it
+//  n_out >= 1
+
 extern "C" size_t ncc_8_u8(
     uint8_t* __restrict reference,
     size_t r_w,
@@ -201,6 +209,8 @@ extern "C" size_t ncc_8_u8(
 
     Match* out_cur = out;
     Match* out_fin = out + n_out;
+
+    acc = (uint32_t*)align_to((uintptr_t)acc, 64);
 
     size_t n = n_w * n_h;
 
@@ -225,10 +235,10 @@ extern "C" size_t ncc_8_u8(
 /*#define ALIGNR*/
 /*#define QUAD*/
 /*#define DELAYED_SUM*/
-#define DELAYED_SUM2
+/*#define DELAYED_SUM2*/
     // OOO produces slightly different output because of its ordering.. duh but then also different b/c we remove overlapping matches
     // so the order matters for that
-/*#define DELAYED_SUM2_OOO*/
+#define DELAYED_SUM2_OOO
 /*#define DELAYED_SUM_BSLRI*/
     // this is about the same as just delayed_sum
 /*#define DELAYED_SUM_ALIGNR*/
@@ -246,7 +256,7 @@ extern "C" size_t ncc_8_u8(
             size_t x = start;
             __m128i windows[8];
             __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
-            for (; x + N <= end; x += N) {
+            for (; x + N < end; x += N) {
                 // this loads 16 elements, then we can shift them over
                 __m128i r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
 
@@ -289,7 +299,7 @@ extern "C" size_t ncc_8_u8(
             __m128i r1, r2;
             if (start + 1 == end) return;
             r1 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
-            for (; x + N <= end; x += N) {
+            for (; x + N < end; x += N) {
                 r2 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x + N]));
 
                 windows[0] = r1;
@@ -343,7 +353,7 @@ extern "C" size_t ncc_8_u8(
             __m256i n = _mm256_set_m128i(n_8, n_8);
             __m128i a;
             size_t x = start;
-            for (; x + (N * 2) <= end; x += (N * 2)) {
+            for (; x + (N * 2) < end; x += (N * 2)) {
                 for (size_t j = 0; j < N; j++) {
                     __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
                     __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
@@ -352,13 +362,13 @@ extern "C" size_t ncc_8_u8(
                     auto a1 = &acc[(x + j) * 4];
                     auto a2 = &acc[(x + N + j) * 4];
                     if (needle_y == 0) {
-                        _mm_storeu_si128((__m128i*)a1, nr1);
-                        _mm_storeu_si128((__m128i*)a2, nr2);
+                        _mm_store_si128((__m128i*)a1, nr1);
+                        _mm_store_si128((__m128i*)a2, nr2);
                     } else {
-                        a = _mm_add_epi32(nr1, _mm_loadu_si128((__m128i*)a1));
-                        _mm_storeu_si128((__m128i*)a1, a);
-                        a = _mm_add_epi32(nr2, _mm_loadu_si128((__m128i*)a2));
-                        _mm_storeu_si128((__m128i*)a2, a);
+                        a = _mm_add_epi32(nr1, _mm_load_si128((__m128i*)a1));
+                        _mm_store_si128((__m128i*)a1, a);
+                        a = _mm_add_epi32(nr2, _mm_load_si128((__m128i*)a2));
+                        _mm_store_si128((__m128i*)a2, a);
                     }
                 }
             }
@@ -366,11 +376,11 @@ extern "C" size_t ncc_8_u8(
                 __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
                 __m128i nr = _mm_madd_epi16(n_8, r); // 4 32 bit partial sums
                 if (needle_y == 0) {
-                    _mm_storeu_si128((__m128i*)&acc[x * 4], nr);
+                    _mm_store_si128((__m128i*)&acc[x * 4], nr);
                 } else {
-                    __m128i a = _mm_loadu_si128((__m128i*)&acc[x * 4]);
+                    __m128i a = _mm_load_si128((__m128i*)&acc[x * 4]);
                     a = _mm_add_epi32(a, nr);
-                    _mm_storeu_si128((__m128i*)&acc[x * 4], a);
+                    _mm_store_si128((__m128i*)&acc[x * 4], a);
                 }
             }
         };
@@ -386,14 +396,11 @@ extern "C" size_t ncc_8_u8(
                     __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
                     __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
                     auto a = acc + acc_offset;
-                    /*if (needle_y == 0 && y == 30) {*/
-                    /*    fprintf(stderr, "DOUBLE x=%ld,%ld acc_offset=%ld,%ld\n", x + j, x + j + 8, acc_offset, acc_offset + 4);*/
-                    /*}*/
                     if (needle_y == 0) {
-                        _mm256_storeu_si256((__m256i*)a, nr);
+                        _mm256_store_si256((__m256i*)a, nr);
                     } else {
-                        nr = _mm256_add_epi32(nr, _mm256_loadu_si256((__m256i*)a));
-                        _mm256_storeu_si256((__m256i*)a, nr);
+                        nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
+                        _mm256_store_si256((__m256i*)a, nr);
                     }
                     acc_offset += 8;
                 }
@@ -401,15 +408,12 @@ extern "C" size_t ncc_8_u8(
             for (; x < end; x++) {
                 __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
                 __m128i nr = _mm_madd_epi16(n_8, r); // 4 32 bit partial sums
-                /*if (needle_y == 0 && y == 30) {*/
-                /*    fprintf(stderr, "DOUBLE SINGLE x=%ld acc_offset=%ld\n", x, x * 4);*/
-                /*}*/
                 auto a = acc + acc_offset;
                 if (needle_y == 0) {
-                    _mm_storeu_si128((__m128i*)a, nr);
+                    _mm_store_si128((__m128i*)a, nr);
                 } else {
-                    nr = _mm_add_epi32(nr, _mm_loadu_si128((__m128i*)a));
-                    _mm_storeu_si128((__m128i*)a, nr);
+                    nr = _mm_add_epi32(nr, _mm_load_si128((__m128i*)a));
+                    _mm_store_si128((__m128i*)a, nr);
                 }
                 acc_offset += 4;
             }
@@ -419,7 +423,7 @@ extern "C" size_t ncc_8_u8(
             __m128i windows[8];
             __m128i n = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
             size_t x = start;
-            for (; x + N  <= end; x += N) {
+            for (; x + N  < end; x += N) {
                 __m128i r1 = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
 
                 windows[0] = r1;
@@ -506,7 +510,7 @@ extern "C" size_t ncc_8_u8(
         auto inner = [&](size_t needle_y) {
             auto n = &needle_u8[needle_y * N];
             size_t x = start;
-            for (; x + 4 <= end; x += 4) {
+            for (; x + 4 < end; x += 4) {
                 __m128i a = _mm_loadu_si128((__m128i*)&acc[x]);
                 __m128i s1 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 0]);
                 __m128i s2 = u8_8_dot_uv(n, &reference[(y + needle_y) * r_w + x + 1]);
@@ -629,7 +633,7 @@ extern "C" size_t ncc_8_u8(
 #else
             double similarity = num / den;
             if (similarity > threshold_d) {
-                *out_cur++ = {(uint32_t)x, (uint32_t)y, (uint32_t)n_w, (uint32_t)n_h, (float)similarity};
+                *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
 #endif
                 return out_cur == out_fin;
             }

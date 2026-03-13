@@ -67,16 +67,14 @@ struct Match {
 struct MatchC {
     x: u32,
     y: u32,
-    w: u32,
-    h: u32,
     similarity: f32,
 }
 
-impl From<MatchC> for Match {
-    fn from(m: MatchC) -> Self {
+impl Match {
+    fn from_matchc(m: MatchC, w: u32, h: u32) -> Self {
         let rect = RectI::new(
             Vector2I::new(m.x as i32, m.y as i32),
-            Vector2I::new(m.w as i32, m.h as i32),
+            Vector2I::new(w as i32, h as i32),
         );
         let similarity = m.similarity;
         Match { rect, similarity }
@@ -350,7 +348,7 @@ impl Searcher {
         let matches = Vec::with_capacity(1024);
         let matches_c = vec![MatchC::default(); MAX_MATCHES];
         // big enough to keep 4 partial sums
-        let acc_u32 = vec![0; img.width() as usize * 4];
+        let acc_u32 = vec![0; img.width() as usize * 4 + 16];
         let needle_f32 = vec![0.; 128];
         let needle_u8 = vec![0; 128];
         let last_patch_size = None;
@@ -493,7 +491,7 @@ impl Searcher {
             }
             self.matches.clear();
             for m in self.matches_c.iter().take(n_matches) {
-                self.matches.push((*m).into());
+                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
             }
             &self.matches
         } else {
@@ -542,7 +540,7 @@ impl Searcher {
             self.matches_c.resize(n_matches, MatchC::default());
             self.matches.clear();
             for m in &self.matches_c {
-                self.matches.push((*m).into());
+                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
             }
             &self.matches
         } else {
@@ -700,11 +698,6 @@ impl Searcher {
                     }
                 }
             }
-            //if y == 599 {
-            //    for acc in self.acc_u32.iter() {
-            //        eprintln!("SUM {acc}");
-            //    }
-            //}
             for (x, acc) in (start..end).zip(self.acc_u32.iter()) {
                 let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
                 let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
@@ -715,16 +708,13 @@ impl Searcher {
                 if num < 0. {
                     continue;
                 }
-                let num_i64 = n as i64 * *acc as i64 - s_n as i64 * s_p as i64;
+                //let num_i64 = n as i64 * *acc as i64 - s_n as i64 * s_p as i64;
                 let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64) as f64 / n as f64;
                 let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64) as f64 / n as f64;
                 debug_assert!(norm2_n > 0.);
                 debug_assert!(norm2_p > 0.);
                 let den = (norm2_n * norm2_p).sqrt();
                 let similarity_f64 = num as f64 / den;
-                if !similarity_f64.is_nan() {
-                    eprintln!("SUM y={y:04} x={x:04} acc={acc} s_p={s_p} ni64={num_i64} sim={similarity_f64:.6}");
-                }
                 let similarity = (num as f64 / den) as f32;
                 debug_assert!(
                     similarity >= -1.01 && similarity <= 1.01,
