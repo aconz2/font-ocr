@@ -97,6 +97,22 @@ unsafe extern "C" {
         out: *mut MatchC,
         n_out: usize,
     ) -> usize;
+
+    fn ncc_16_u8(
+        reference: *const u8,
+        r_w: usize,
+        r_h: usize,
+        needle_u8: *const u8,
+        n_w: usize,
+        n_h: usize,
+        acc: *mut u32,
+        patch_sum: *const u32,
+        patch_rnorm: *const f64,
+        start_end: *const u16,
+        threshold: f32,
+        out: *mut MatchC,
+        n_out: usize,
+    ) -> usize;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -365,7 +381,7 @@ impl Searcher {
         let n_w = size.x() as usize;
         let n = n_h * n_w;
 
-        let (r_w, r_h) = (self.reference_f32.cols, self.reference_f32.rows);
+        let (r_w, r_h) = (self.reference_u8.cols, self.reference_u8.rows);
 
         let x_searches = r_w - n_w + 1;
         let y_searches = r_h - n_h + 1;

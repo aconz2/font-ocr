@@ -8,6 +8,12 @@ struct Match {
     float similarity;
 };
 
+static inline __m128i u32_4_sum(__m128i v) {
+    v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
+    v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
+    return v;
+}
+
 // sum 4 u32 in each lane, sum gets put in each lane
 static inline __m256i u32_4_2_sum(__m256i v) {
     v = _mm256_add_epi32(v, _mm256_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
@@ -30,6 +36,7 @@ static inline uintptr_t align_to(uintptr_t p, size_t N) {
 // requirements:
 //  acc has at least 32 extra bytes so we can align it
 //  n_out >= 1
+//  n_h >= 2
 
 extern "C" size_t ncc_8_u8(
     uint8_t* reference,
@@ -74,22 +81,6 @@ extern "C" size_t ncc_8_u8(
     __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
     __m256d vthreshold = _mm256_set1_pd(threshold);
 
-    auto process = [&](size_t acc_i, size_t x, size_t y) {
-        uint32_t acc_ = 0;
-        for (size_t i = 0; i < 4; i ++) {
-            acc_ += acc[acc_i + i];
-        }
-        uint32_t s_p = patch_sum[y * r_w + x];
-        double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
-        double den = rnorm_n * patch_rnorm[y * r_w + x];
-        double similarity = num * den;
-        if (similarity > threshold_d) {
-            *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
-            return out_cur == out_fin;
-        }
-        return false;
-    };
-
     auto processv = [&out_cur, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, size_t y) {
         // acc - s_p * s_n * (1 / n)
         /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
@@ -117,6 +108,7 @@ extern "C" size_t ncc_8_u8(
 
         // needle gets replicated across both halfs so we can search at x and x+8 at the same time
         // acc gets pairs of 4 partial sums from (x, x+8) in a row, then the tail handling is as normal
+        // on the last row of the needle, we accumulate the sums
         for (size_t needle_y = 0; needle_y < n_h; needle_y++) {
             __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * 8]));
             __m256i n = _mm256_set_m128i(n_8, n_8);
@@ -128,6 +120,10 @@ extern "C" size_t ncc_8_u8(
                     __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
                     auto a = acc + acc_offset;
                     if (needle_y == 0) {
+                        _mm256_store_si256((__m256i*)a, nr);
+                    } else if (needle_y == n_h - 1) {
+                        nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
+                        nr = u32_4_2_sum(nr);
                         _mm256_store_si256((__m256i*)a, nr);
                     } else {
                         nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
@@ -141,6 +137,10 @@ extern "C" size_t ncc_8_u8(
                 __m128i nr = _mm_madd_epi16(n_8, r); // 4 32 bit partial sums
                 auto a = acc + acc_offset;
                 if (needle_y == 0) {
+                    _mm_store_si128((__m128i*)a, nr);
+                } else if (needle_y == n_h - 1) {
+                    nr = _mm_add_epi32(nr, _mm_load_si128((__m128i*)a));
+                    nr = u32_4_sum(nr);
                     _mm_store_si128((__m128i*)a, nr);
                 } else {
                     nr = _mm_add_epi32(nr, _mm_load_si128((__m128i*)a));
@@ -156,7 +156,7 @@ extern "C" size_t ncc_8_u8(
             __m256i A[8];
             // A holds acc sums in lo-hi lane pairs for 0,8 1,9 2,10 ... 7,15
             for (size_t i = 0; i < 8; i++) {
-                A[i] = u32_4_2_sum(_mm256_load_si256((__m256i*)&acc[acc_offset + i * 8]));
+                A[i] = _mm256_load_si256((__m256i*)&acc[acc_offset + i * 8]);
             }
             acc_offset += 8 * 8;
 
@@ -196,7 +196,14 @@ extern "C" size_t ncc_8_u8(
             }
         }
         for (; x < end; x++) {
-            if (process(acc_offset, x, y)) {
+            // acc is really 4 wide but we already summed on the last loop
+            uint32_t acc_ = acc[0];
+            uint32_t s_p = patch_sum[y * r_w + x];
+            double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
+            double den = rnorm_n * patch_rnorm[y * r_w + x];
+            double similarity = num * den;
+            if (similarity > threshold_d) {
+                *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
                 return n_out;
             }
             acc_offset += 4;
@@ -249,22 +256,6 @@ extern "C" size_t ncc_16_u8(
     __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
     __m256d vthreshold = _mm256_set1_pd(threshold);
 
-    auto process = [&](size_t acc_i, size_t x, size_t y) {
-        uint32_t acc_ = 0;
-        for (size_t i = 0; i < 8; i ++) {
-            acc_ += acc[acc_i + i];
-        }
-        uint32_t s_p = patch_sum[y * r_w + x];
-        double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
-        double den = rnorm_n * patch_rnorm[y * r_w + x];
-        double similarity = num * den;
-        if (similarity > threshold_d) {
-            *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
-            return out_cur == out_fin;
-        }
-        return false;
-    };
-
     auto processv = [&out_cur, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, size_t y) {
         // acc - s_p * s_n * (1 / n)
         /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
@@ -300,6 +291,10 @@ extern "C" size_t ncc_16_u8(
                 auto a = acc + acc_offset;
                 if (needle_y == 0) {
                     _mm256_store_si256((__m256i*)a, nr);
+                } else if (needle_y == n_h - 1) {
+                    nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
+                    __m128i s = u32_8_sum(nr);
+                    _mm_store_si128((__m128i*)a, s);
                 } else {
                     nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
                     _mm256_store_si256((__m256i*)a, nr);
@@ -313,8 +308,10 @@ extern "C" size_t ncc_16_u8(
         for (; x + 4 < end; x += 4) {
             __m128i A[4];
             // A holds acc sums in order for 0,1,2,3
+            // note that acc does hold 8 partial sums, but the last loop above
+            // sums them and stores 4 sums
             for (size_t i = 0; i < 4; i++) {
-                A[i] = u32_8_sum(_mm256_load_si256((__m256i*)&acc[acc_offset + i * 8]));
+                A[i] = _mm_load_si128((__m128i*)&acc[acc_offset + i * 8]);
             }
             acc_offset += 4 * 8;
 
@@ -331,7 +328,16 @@ extern "C" size_t ncc_16_u8(
             }
         }
         for (; x < end; x++) {
-            if (process(acc_offset, x, y)) {
+            uint32_t acc_ = 0;
+            for (size_t i = 0; i < 8; i ++) {
+                acc_ += acc[acc_offset + i];
+            }
+            uint32_t s_p = patch_sum[y * r_w + x];
+            double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
+            double den = rnorm_n * patch_rnorm[y * r_w + x];
+            double similarity = num * den;
+            if (similarity > threshold_d) {
+                *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
                 return n_out;
             }
             acc_offset += 4;
