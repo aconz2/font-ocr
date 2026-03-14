@@ -8,61 +8,6 @@ struct Match {
     float similarity;
 };
 
-static inline uint32_t ncc_sum_table_sum(uint32_t* s, size_t W, size_t x, size_t y, size_t w, size_t h) {
-    auto at = [s, W](size_t x, size_t y) {
-        return s[y * W + x];
-    };
-    auto a = at(x + w - 1, y + h - 1);
-    auto b = at(x     - 1, y + h - 1);
-    auto c = at(x + w - 1, y     - 1);
-    auto d = at(x     - 1, y     - 1);
-    return a + d - b - c;
-}
-
-static inline uint64_t ncc_sumsqr_table_sum(uint64_t* s, size_t W, size_t x, size_t y, size_t w, size_t h) {
-    auto at = [s, W](size_t x, size_t y) {
-        return s[y * W + x];
-    };
-    auto a = at(x + w - 1, y + h - 1);
-    auto b = at(x     - 1, y + h - 1);
-    auto c = at(x + w - 1, y     - 1);
-    auto d = at(x     - 1, y     - 1);
-    return a + d - b - c;
-}
-
-const size_t N = 8;
-
-static inline __m128i u16v_8_dot_v(__m128i a, __m128i b) {
-    // a b c d e f g h
-    // the madd gives us
-    // 0  1  2  3
-    // ab cd ef gh
-    // ef gh ab cd + <- shuffle
-    // abef cdgh efab ghcd
-    // 0    1    2    3
-    // abef cdgh efab ghcd + <- shuffle
-    // cdgh abef ghcd efab
-    __m128i x = _mm_madd_epi16(a, b);
-    x = _mm_add_epi32(x, _mm_shuffle_epi32(x, _MM_SHUFFLE(2, 3, 0, 1)));
-    x = _mm_add_epi32(x, _mm_shuffle_epi32(x, _MM_SHUFFLE(1, 0, 3, 2)));
-    return x;
-};
-static inline uint32_t u16v_8_dot(__m128i a, __m128i b) {
-    auto x = u16v_8_dot_v(a, b);
-    return _mm_cvtsi128_si32(x);
-}
-
-static inline uint32_t u8_8_dot_u(uint8_t* a, uint8_t* b) {
-    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)a));
-    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)b));
-    return u16v_8_dot(a_, b_);
-};
-
-static inline __m128i u8_8_dot_uv(uint8_t* a, uint8_t* b) {
-    __m128i a_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)a));
-    __m128i b_ = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)b));
-    return u16v_8_dot_v(a_, b_);
-};
 static inline __m256i u32_4_2_sum(__m256i v) {
     v = _mm256_add_epi32(v, _mm256_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
     v = _mm256_add_epi32(v, _mm256_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
@@ -74,15 +19,14 @@ static inline uintptr_t align_to(uintptr_t p, size_t N) {
 }
 
 // requirements:
-//  acc has at least 64 extra bytes so we can align it
+//  acc has at least 32 extra bytes so we can align it
 //  n_out >= 1
 
 extern "C" size_t ncc_8_u8(
-    uint8_t* __restrict reference,
+    uint8_t* reference,
     size_t r_w,
     size_t r_h,
-    uint8_t* needle,
-    uint8_t* __restrict needle_u8, // this is N * n_h sized
+    uint8_t* needle_u8, // this is N * n_h sized
     size_t n_w,
     size_t n_h,
     uint32_t* acc,
@@ -93,22 +37,27 @@ extern "C" size_t ncc_8_u8(
     Match* out,
     size_t n_out
         ) {
+    const size_t N = 8;
+
     double threshold_d = threshold;
 
     Match* out_cur = out;
     Match* out_fin = out + n_out;
 
-    acc = (uint32_t*)align_to((uintptr_t)acc, 64);
+    acc = (uint32_t*)align_to((uintptr_t)acc, 32);
 
     size_t n = n_w * n_h;
 
     uint32_t s_n = 0;
     uint32_t s2_n = 0;
 
-    for (size_t i = 0; i < n_w * n_h; i++) {
-        s_n += needle[i];
-        s2_n += (uint32_t)needle[i] * (uint32_t)needle[i];
+    for (size_t i = 0; i < n_h; i++) {
+        for (size_t j = 0; j < N; j++) {
+            s_n += needle_u8[i * N + j];
+            s2_n += (uint32_t)needle_u8[i * N + j] * (uint32_t)needle_u8[i * N + j];
+        }
     }
+
     double norm2_n = (double)s2_n - (double)((uint64_t)s_n * (uint64_t)s_n) / (double)n;
     double rnorm_n = 1. / sqrt(norm2_n);
     double n_recip = 1. / (double)n;
@@ -161,12 +110,13 @@ extern "C" size_t ncc_8_u8(
         const uint16_t start = start_end[y * 2 + 0];
         const uint16_t end = start_end[y * 2 + 1];
 
+        // needle gets replicated across both halfs so we can search at x and x+8 at the same time
+        // acc gets pairs of 4 partial sums from (x, x+8) in a row, then the tail handling is as normal
         for (size_t needle_y = 0; needle_y < n_h; needle_y++) {
             __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * N]));
             __m256i n = _mm256_set_m128i(n_8, n_8);
             size_t x = start;
             size_t acc_offset = 0;
-            // acc gets pairs of 4 partial sums from (x, x+8) in a row, then the tail handling is as is
             for (; x + (N * 2) < end; x += (N * 2)) {
                 for (size_t j = 0; j < N; j++) {
                     __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
@@ -206,17 +156,16 @@ extern "C" size_t ncc_8_u8(
             acc_offset += 8 * 8;
 
             // we want to shuffle these into 4 32bit sums to then expand into doubles in order
-            // these diagrams are mirrored from lane layout
+            // (these diagrams are mirrored from lane layout)
             // each digit is the 32 bit sum
             // 0000,8888 1111,9999 2222,AAAA 3333,BBBB -> 0123,xxxx 89AB,xxxx -> 0x1x,2x3x 8x9x,AxBx
-            // 0000,8888 1111,9999 2222,AAAA 3333,BBBB -> 0819,xxxx 2A3B,xxxx -> 0x8x,1x9x 2xAx,3xBx
             //
             // 0000,8888
             // 1111,9999 unpacklo_epi32
             // 0101,8989
             // 2323,ABAB from other unpacklo_epi32
             // 0123,89AB blend
-            // extract lanes and convert
+            // 0d1d,2d3d 8d9d,AdBd extract lanes and convert (d is the double)
             auto unpack = [](__m256d* v0123_d, __m256d* v89AB_d, __m256i v08, __m256i v19, __m256i v2A, __m256i v3B) {
                 __m256i v0189 = _mm256_unpacklo_epi32(v08, v19);
                 __m256i v23AB = _mm256_unpacklo_epi32(v2A, v3B);

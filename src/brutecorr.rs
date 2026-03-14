@@ -86,7 +86,6 @@ unsafe extern "C" {
         reference: *const u8,
         r_w: usize,
         r_h: usize,
-        needle: *const u8,
         needle_u8: *const u8,
         n_w: usize,
         n_h: usize,
@@ -331,8 +330,8 @@ impl Searcher {
 
         let matches = Vec::with_capacity(1024);
         let matches_c = vec![MatchC::default(); MAX_MATCHES];
-        // big enough to keep 4 partial sums
-        let acc_u32 = vec![0; img.width() as usize * 4 + 16];
+        // big enough to keep 4 partial sums and 32 bytes extra to align
+        let acc_u32 = vec![0; img.width() as usize * 4 + 8];
         let needle_f32 = vec![0.; 128];
         let needle_u8 = vec![0; 128];
         let last_patch_size = None;
@@ -457,7 +456,6 @@ impl Searcher {
                     self.reference_u8.data.as_ptr(),
                     self.reference_u8.cols,
                     self.reference_u8.rows,
-                    needle.as_ptr(),
                     self.needle_u8.as_ptr(),
                     n_w,
                     n_h,
