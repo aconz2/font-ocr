@@ -673,6 +673,7 @@ extern "C" size_t ncc_8_u8(
             // 2323,ABAB from other unpacklo_epi32
             // 0123,89AB blend
             // extract lanes and convert
+/*#define FOO*/
             auto unpack = [](__m256d* v0123_d, __m256d* v89AB_d, __m256i v08, __m256i v19, __m256i v2A, __m256i v3B) {
                 __m256i v0189 = _mm256_unpacklo_epi32(v08, v19);
                 __m256i v23AB = _mm256_unpacklo_epi32(v2A, v3B);
@@ -687,7 +688,11 @@ extern "C" size_t ncc_8_u8(
             __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
             __m256d vthreshold = _mm256_set1_pd(threshold);
 
+#ifdef FOO
+            auto processv = [&out_cur, y, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, __m256d* out_sim, int* out_mask) {
+#else
             auto processv = [&out_cur, y, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x) {
+#endif
                 // acc - s_p * s_n * (1 / n)
                 /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
                 __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc);
@@ -695,7 +700,23 @@ extern "C" size_t ncc_8_u8(
                 __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
                 __m256d sim = _mm256_mul_pd(num, den);
                 int mask = _mm256_movemask_pd(_mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ));
+#ifdef FOO
+                *out_mask = mask;
+                *out_sim = sim;
+#else
                 if (mask == 0) return false; // fast path for no hits
+/*#define CTZ // slower*/
+#ifdef CTZ
+                while (mask) {
+                    int i = __builtin_ctz(mask);
+                    float sim_ = sim[i];
+                    *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, sim_};
+                    if (out_cur == out_fin) {
+                        return true;
+                    }
+                    mask ^= (1 << i);
+                }
+#else
                 for (size_t i = 0; i < 4; i++) {
                     if ((1 << i) & mask) {
                         float sim_ = sim[i]; // TIL you can index into the lane
@@ -705,14 +726,16 @@ extern "C" size_t ncc_8_u8(
                         }
                     }
                 }
+#endif
                 return false;
+#endif
             };
 
-            __m256d v0123_d, v89AB_d, v4567_d, vCDEF_d;
-            //                         08    19    2A    3B
-            unpack(&v0123_d, &v89AB_d, W[0], W[1], W[2], W[3]);
-            //                         4C    5D    6E    7F
-            unpack(&v4567_d, &vCDEF_d, W[4], W[5], W[6], W[7]);
+            __m256d v0123_acc, v89AB_acc, v4567_acc, vCDEF_acc;
+            //                             08    19    2A    3B
+            unpack(&v0123_acc, &v89AB_acc, W[0], W[1], W[2], W[3]);
+            //                             4C    5D    6E    7F
+            unpack(&v4567_acc, &vCDEF_acc, W[4], W[5], W[6], W[7]);
 
             __m256d v0123_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x]));
             __m256d v0123_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x]);
@@ -726,10 +749,29 @@ extern "C" size_t ncc_8_u8(
             __m256d vCDEF_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x + 12]));
             __m256d vCDEF_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x + 12]);
 
-            if (processv(v0123_d, v0123_s_p, v0123_rn_p, x + 0)) { return n_out; }
-            if (processv(v4567_d, v4567_s_p, v4567_rn_p, x + 4)) { return n_out; }
-            if (processv(v89AB_d, v89AB_s_p, v89AB_rn_p, x + 8)) { return n_out; }
-            if (processv(vCDEF_d, vCDEF_s_p, vCDEF_rn_p, x + 12)) { return n_out; }
+#ifdef FOO
+            int m0, m4, m8, mC;
+            __m256d sim0, sim4, sim8, simC;
+            processv(v0123_acc, v0123_s_p, v0123_rn_p, x + 0, &sim0, &m0);
+            processv(v4567_acc, v4567_s_p, v4567_rn_p, x + 4, &sim4, &m4);
+            processv(v89AB_acc, v89AB_s_p, v89AB_rn_p, x + 8, &sim8, &m8);
+            processv(vCDEF_acc, vCDEF_s_p, vCDEF_rn_p, x + 12, &simC, &mC);
+            int m = (m0) | (m4 << 4) | (m8 << 8) | (mC << 12);
+            while (m) {
+                int i = __builtin_ctz(m);
+                float sim_ = 1.0; // TODO
+                *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, sim_};
+                if (out_cur == out_fin) {
+                    return n_out;
+                }
+                m ^= (1 << i);
+            }
+#else
+            if (processv(v0123_acc, v0123_s_p, v0123_rn_p, x + 0)) { return n_out; }
+            if (processv(v4567_acc, v4567_s_p, v4567_rn_p, x + 4)) { return n_out; }
+            if (processv(v89AB_acc, v89AB_s_p, v89AB_rn_p, x + 8)) { return n_out; }
+            if (processv(vCDEF_acc, vCDEF_s_p, vCDEF_rn_p, x + 12)) { return n_out; }
+#endif
 
 #else
             // process pairs
