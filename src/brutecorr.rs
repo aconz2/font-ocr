@@ -113,6 +113,22 @@ unsafe extern "C" {
         out: *mut MatchC,
         n_out: usize,
     ) -> usize;
+
+    fn ncc_16_u8_7b(
+        reference: *const u8,
+        r_w: usize,
+        r_h: usize,
+        needle_u8: *const u8,
+        n_w: usize,
+        n_h: usize,
+        acc: *mut u32,
+        patch_sum: *const u32,
+        patch_rnorm: *const f64,
+        start_end: *const u16,
+        threshold: f32,
+        out: *mut MatchC,
+        n_out: usize,
+    ) -> usize;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -131,16 +147,19 @@ type SumSqrTableT = u64;
 struct Searcher {
     reference_f32: Array2<f32>,
     reference_u8: Array2<u8>,
+    reference_u8_7b: Array2<u8>,
     patch_sum: Array2<SumTableT>,
     patch_rnorm: Array2<f64>,
     sum_table: Array2<SumTableT>,
     sumsqr_table: Array2<SumSqrTableT>,
+    sum_table_7b: Array2<SumTableT>,
+    sumsqr_table_7b: Array2<SumSqrTableT>,
     acc_u32: Vec<u32>,
     needle_f32: Vec<f32>,
     needle_u8: Vec<u8>,
     matches: Vec<Match>,
     matches_c: Vec<MatchC>,
-    last_patch_size: Option<Vector2I>,
+    last_patch_size: Option<(Vector2I, bool)>,
     start_end: Vec<u16>,
 }
 
@@ -338,8 +357,11 @@ fn ncc_sumsqr_table_sum_nz(
 impl Searcher {
     fn new(img: &GrayImage) -> Searcher {
         let reference_u8 = image_to_u8(img);
+        let reference_u8_7b = image_to_u8_7b(&reference_u8);
         let sum_table = ncc_sum_table(&reference_u8);
         let sumsqr_table = ncc_sumsqr_table(&reference_u8);
+        let sum_table_7b = ncc_sum_table(&reference_u8_7b);
+        let sumsqr_table_7b = ncc_sumsqr_table(&reference_u8_7b);
         let reference_f32 = image_to_f32(img);
         let patch_sum = Array2::new(img.height() as usize, img.width() as usize);
         let patch_norm = Array2::new(img.height() as usize, img.width() as usize);
@@ -356,8 +378,11 @@ impl Searcher {
         Searcher {
             reference_f32,
             reference_u8,
+            reference_u8_7b,
             sum_table,
             sumsqr_table,
+            sum_table_7b,
+            sumsqr_table_7b,
             needle_u8,
             needle_f32,
             acc_u32,
@@ -370,9 +395,9 @@ impl Searcher {
         }
     }
 
-    fn prepare_for_size(&mut self, size: Vector2I) {
+    fn prepare_for_size(&mut self, size: Vector2I, b7: bool) {
         if let Some(s) = self.last_patch_size
-            && s == size
+            && s == (size, b7)
         {
             return;
         }
@@ -380,6 +405,12 @@ impl Searcher {
         let n_h = size.y() as usize;
         let n_w = size.x() as usize;
         let n = n_h * n_w;
+
+        let (sum_table, sumsqr_table) = if b7 {
+            (&self.sum_table_7b, &self.sumsqr_table_7b)
+        } else {
+            (&self.sum_table, &self.sumsqr_table)
+        };
 
         let (r_w, r_h) = (self.reference_u8.cols, self.reference_u8.rows);
 
@@ -390,7 +421,7 @@ impl Searcher {
             let start = {
                 let mut x = 1;
                 while x < x_searches {
-                    let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
+                    let s_p = ncc_sum_table_sum_nz(sum_table, (x, y), (n_w, n_h));
                     if s_p != 0 {
                         break;
                     }
@@ -401,7 +432,7 @@ impl Searcher {
             let end = {
                 let mut x = x_searches - 1;
                 while x > start {
-                    let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
+                    let s_p = ncc_sum_table_sum_nz(sum_table, (x, y), (n_w, n_h));
                     if s_p != 0 {
                         break;
                     }
@@ -414,8 +445,8 @@ impl Searcher {
             //    debug_assert!(ncc_sum_table_sum_nz(&self.sum_table, (end - 1, y), (n_w, n_h)) != 0, "end y={y} start={start} end={end}");
             //}
             for x in start..end {
-                let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
-                let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
+                let s_p = ncc_sum_table_sum_nz(sum_table, (x, y), (n_w, n_h));
+                let s2_p = ncc_sumsqr_table_sum_nz(sumsqr_table, (x, y), (n_w, n_h));
                 let norm = s2_p as f64 - ((s_p as u64 * s_p as u64) as f64) / n as f64;
                 self.patch_sum[(x, y)] = s_p;
                 self.patch_rnorm[(x, y)] = 1. / norm.sqrt();
@@ -424,11 +455,11 @@ impl Searcher {
             self.start_end[y * 2 + 1] = end.try_into().unwrap();
         }
 
-        self.last_patch_size = Some(size);
+        self.last_patch_size = Some((size, b7));
     }
 
     fn search_f32(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
-        self.prepare_for_size(size);
+        self.prepare_for_size(size, false);
         let w = size.x();
         if w <= 8 {
             self.search_n_f32::<8>(needle, size, threshold)
@@ -441,7 +472,7 @@ impl Searcher {
     }
 
     fn search_u8(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
-        self.prepare_for_size(size);
+        self.prepare_for_size(size, false);
         let w = size.x();
         if w <= 8 {
             self.search_n_u8::<8>(needle, size, threshold)
@@ -455,7 +486,7 @@ impl Searcher {
 
     fn search_c_u8(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
         // TODO I think I need to prepare_for_size with the width as 8
-        self.prepare_for_size(size);
+        self.prepare_for_size(size, false);
         let n_h = size.y() as usize;
         let n_w = size.x() as usize;
         if n_w <= 8 {
@@ -531,7 +562,54 @@ impl Searcher {
         }
     }
 
+    fn search_c_u8_7b(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
+        self.prepare_for_size(size, true);
+        let n_h = size.y() as usize;
+        let n_w = size.x() as usize;
+        if n_w <= 16 {
+            const N: usize = 16;
+
+            self.needle_u8.resize(N * n_h, 0);
+            {
+                let (rows, _rem) = self.needle_u8.as_chunks_mut::<N>();
+                copy_needle_n_u8(rows, needle, size);
+                for row in rows {
+                    *row = row.map(|x| x / 2);
+                }
+            }
+
+            let n_matches = unsafe {
+                ncc_16_u8_7b(
+                    self.reference_u8_7b.data.as_ptr(),
+                    self.reference_u8.cols,
+                    self.reference_u8.rows,
+                    self.needle_u8.as_ptr(),
+                    n_w,
+                    n_h,
+                    self.acc_u32.as_mut_ptr(),
+                    self.patch_sum.data.as_ptr(),
+                    self.patch_rnorm.data.as_ptr(),
+                    self.start_end.as_ptr(),
+                    threshold,
+                    self.matches_c.as_mut_ptr(),
+                    self.matches_c.len(),
+                )
+            };
+            if n_matches == MAX_MATCHES {
+                eprintln!("WARN got >= {n_matches} matches");
+            }
+            self.matches.clear();
+            for m in self.matches_c.iter().take(n_matches) {
+                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
+            }
+            &self.matches
+        } else {
+            todo!()
+        }
+    }
+
     // note that we skip the first row and col of reference to make the indexing easier
+    //
     // and because the needle is padded up to N, we won't search the last N - needle.width()
     // cols
     #[inline(never)]
@@ -766,6 +844,9 @@ struct Args {
 
     #[arg(long)]
     batch: bool,
+
+    #[arg(long)]
+    seven: bool,
 }
 
 fn main() {
@@ -922,7 +1003,11 @@ fn main() {
             }
             let hits = if args.u8 {
                 if args.c {
-                    searcher.search_c_u8(&needle, size, args.threshold)
+                    if args.seven {
+                        searcher.search_c_u8_7b(&needle, size, args.threshold)
+                    } else {
+                        searcher.search_c_u8(&needle, size, args.threshold)
+                    }
                 } else {
                     searcher.search_u8(&needle, size, args.threshold)
                 }
@@ -1047,6 +1132,12 @@ fn image_to_u8(img: &GrayImage) -> Array2<u8> {
     let rows = img.height() as usize;
     let cols = img.width() as usize;
     Array2 { data, rows, cols }
+}
+
+fn image_to_u8_7b(img: &Array2<u8>) -> Array2<u8> {
+    let mut data = img.data.clone();
+    data.iter_mut().for_each(|x| { *x /= 2; });
+    Array2 { data, rows: img.rows, cols: img.cols }
 }
 
 fn canvas_to_u8(canvas: &Canvas) -> Vec<u8> {
