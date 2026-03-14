@@ -492,8 +492,42 @@ impl Searcher {
                 self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
             }
             &self.matches
+        } else if n_w <= 16 {
+            const N: usize = 16;
+
+            self.needle_u8.resize(N * n_h, 0);
+            {
+                let (rows, _rem) = self.needle_u8.as_chunks_mut::<N>();
+                copy_needle_n_u8(rows, needle, size);
+            }
+
+            let n_matches = unsafe {
+                ncc_16_u8(
+                    self.reference_u8.data.as_ptr(),
+                    self.reference_u8.cols,
+                    self.reference_u8.rows,
+                    self.needle_u8.as_ptr(),
+                    n_w,
+                    n_h,
+                    self.acc_u32.as_mut_ptr(),
+                    self.patch_sum.data.as_ptr(),
+                    self.patch_rnorm.data.as_ptr(),
+                    self.start_end.as_ptr(),
+                    threshold,
+                    self.matches_c.as_mut_ptr(),
+                    self.matches_c.len(),
+                )
+            };
+            if n_matches == MAX_MATCHES {
+                eprintln!("WARN got >= {n_matches} matches");
+            }
+            self.matches.clear();
+            for m in self.matches_c.iter().take(n_matches) {
+                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
+            }
+            &self.matches
         } else {
-            todo!()
+            panic!("not handled")
         }
     }
 

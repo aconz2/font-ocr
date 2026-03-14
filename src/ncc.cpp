@@ -113,12 +113,12 @@ extern "C" size_t ncc_8_u8(
             __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * 8]));
             __m256i n = _mm256_set_m128i(n_8, n_8);
             size_t x = start;
-            size_t acc_offset = 0;
+            size_t acc_i = 0;
             for (; x + (8 * 2) < end; x += (8 * 2)) {
                 for (size_t j = 0; j < 8; j++) {
                     __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
                     __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
-                    auto a = acc + acc_offset;
+                    auto a = acc + acc_i;
                     if (needle_y == 0) {
                         _mm256_store_si256((__m256i*)a, nr);
                     } else if (needle_y == n_h - 1) {
@@ -129,13 +129,13 @@ extern "C" size_t ncc_8_u8(
                         nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
                         _mm256_store_si256((__m256i*)a, nr);
                     }
-                    acc_offset += 8;
+                    acc_i += 8;
                 }
             }
             for (; x < end; x++) {
                 __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
                 __m128i nr = _mm_madd_epi16(n_8, r); // 4 32 bit partial sums
-                auto a = acc + acc_offset;
+                auto a = acc + acc_i;
                 if (needle_y == 0) {
                     _mm_store_si128((__m128i*)a, nr);
                 } else if (needle_y == n_h - 1) {
@@ -146,19 +146,19 @@ extern "C" size_t ncc_8_u8(
                     nr = _mm_add_epi32(nr, _mm_load_si128((__m128i*)a));
                     _mm_store_si128((__m128i*)a, nr);
                 }
-                acc_offset += 4;
+                acc_i += 4;
             }
         }
 
         size_t x = start;
-        size_t acc_offset = 0;
+        size_t acc_i = 0;
         for (; x + (8 * 2) < end; x += (8 * 2)) {
             __m256i A[8];
             // A holds acc sums in lo-hi lane pairs for 0,8 1,9 2,10 ... 7,15
             for (size_t i = 0; i < 8; i++) {
-                A[i] = _mm256_load_si256((__m256i*)&acc[acc_offset + i * 8]);
+                A[i] = _mm256_load_si256((__m256i*)&acc[acc_i + i * 8]);
             }
-            acc_offset += 8 * 8;
+            acc_i += 8 * 8;
 
             // we want to shuffle these into 4 32bit sums to then expand into doubles in order
             // (these diagrams are mirrored from lane layout)
@@ -195,6 +195,9 @@ extern "C" size_t ncc_8_u8(
                 }
             }
         }
+
+        // could also process the tail 4 at a time as in the N=16 case but doesn't make a difference
+
         for (; x < end; x++) {
             // acc is really 4 wide but we already summed on the last loop
             uint32_t acc_ = acc[0];
@@ -206,7 +209,7 @@ extern "C" size_t ncc_8_u8(
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
                 return n_out;
             }
-            acc_offset += 4;
+            acc_i += 4;
         }
     }
 
@@ -283,12 +286,11 @@ extern "C" size_t ncc_16_u8(
 
         for (size_t needle_y = 0; needle_y < n_h; needle_y++) {
             __m256i n_16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&needle_u8[needle_y * 16]));
-            size_t x = start;
-            size_t acc_offset = 0;
+            size_t acc_i = 0;
             for (size_t x = start; x < end; x++) {
                 __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]));
                 __m256i nr = _mm256_madd_epi16(n_16, r); // 8 32 bit partial sums
-                auto a = acc + acc_offset;
+                auto a = acc + acc_i;
                 if (needle_y == 0) {
                     _mm256_store_si256((__m256i*)a, nr);
                 } else if (needle_y == n_h - 1) {
@@ -299,27 +301,16 @@ extern "C" size_t ncc_16_u8(
                     nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
                     _mm256_store_si256((__m256i*)a, nr);
                 }
-                acc_offset += 8;
+                acc_i += 8;
             }
         }
 
         size_t x = start;
-        size_t acc_offset = 0;
+        size_t acc_i = 0;
         for (; x + 4 < end; x += 4) {
-            __m128i A[4];
-            // A holds acc sums in order for 0,1,2,3
-            // note that acc does hold 8 partial sums, but the last loop above
-            // sums them and stores 4 sums
-            for (size_t i = 0; i < 4; i++) {
-                A[i] = _mm_load_si128((__m128i*)&acc[acc_offset + i * 8]);
-            }
-            acc_offset += 4 * 8;
-
-            __m128i vacc = _mm_blend_epi32(
-                _mm_blend_epi32(A[0], A[1], 0b0010),
-                _mm_blend_epi32(A[2], A[3], 0b1000),
-                0b1100
-            );
+            // last loop trip above sums the 8 lanes down into the first 4 entries
+            __m128i vacc = _mm_set_epi32(acc[acc_i + 24], acc[acc_i + 16], acc[acc_i + 8], acc[acc_i]);
+            acc_i += 4 * 8;
             __m256d vacc_d =_mm256_cvtepi32_pd(vacc);
             __m256d v_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x]));
             __m256d v_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x]);
@@ -330,7 +321,7 @@ extern "C" size_t ncc_16_u8(
         for (; x < end; x++) {
             uint32_t acc_ = 0;
             for (size_t i = 0; i < 8; i ++) {
-                acc_ += acc[acc_offset + i];
+                acc_ += acc[acc_i + i];
             }
             uint32_t s_p = patch_sum[y * r_w + x];
             double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
@@ -340,7 +331,7 @@ extern "C" size_t ncc_16_u8(
                 *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
                 return n_out;
             }
-            acc_offset += 4;
+            acc_i += 4;
         }
     }
 
