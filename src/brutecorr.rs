@@ -82,22 +82,6 @@ impl Match {
 }
 
 unsafe extern "C" {
-    fn ncc_8_f32(
-        reference: *const f32,
-        r_w: usize,
-        r_h: usize,
-        sum_table: *const u32,
-        sumsqr_table: *const u64,
-        needle: *const u8,
-        needle_f: *const f32,
-        n_w: usize,
-        n_h: usize,
-        acc: *mut u32,
-        threshold: f32,
-        out: *mut MatchC,
-        n_out: usize,
-    ) -> usize;
-
     fn ncc_8_u8(
         reference: *const u8,
         r_w: usize,
@@ -491,55 +475,6 @@ impl Searcher {
             }
             self.matches.clear();
             for m in self.matches_c.iter().take(n_matches) {
-                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
-            }
-            &self.matches
-        } else {
-            todo!()
-        }
-    }
-
-    fn search_c_f32(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
-        self.prepare_for_size(size);
-        let n_h = size.y() as usize;
-        let n_w = size.x() as usize;
-        if n_w <= 8 {
-            const N: usize = 8;
-            let max_matches = 1024;
-            self.matches_c.resize(max_matches, MatchC::default());
-
-            self.needle_f32.resize(N * n_h, PixelType::default());
-            {
-                let (rows, _rem) = self.needle_f32.as_chunks_mut::<N>();
-                copy_needle_n_f32(rows, needle, size);
-            }
-
-            let x_searches = self.reference_f32.cols - N + 1;
-            self.acc_u32.fill(0);
-            self.acc_u32.resize(x_searches - 1, 0);
-            let n_matches = unsafe {
-                ncc_8_f32(
-                    self.reference_f32.data.as_ptr(),
-                    self.reference_f32.cols,
-                    self.reference_f32.rows,
-                    self.sum_table.data.as_ptr(),
-                    self.sumsqr_table.data.as_ptr(),
-                    needle.as_ptr(),
-                    self.needle_f32.as_ptr(),
-                    n_w,
-                    n_h,
-                    self.acc_u32.as_mut_ptr(),
-                    threshold,
-                    self.matches_c.as_mut_ptr(),
-                    self.matches_c.len(),
-                )
-            };
-            if n_matches == max_matches {
-                eprintln!("WARN got >= {n_matches} matches");
-            }
-            self.matches_c.resize(n_matches, MatchC::default());
-            self.matches.clear();
-            for m in &self.matches_c {
                 self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
             }
             &self.matches
@@ -945,7 +880,7 @@ fn main() {
                 }
             } else {
                 if args.c {
-                    searcher.search_c_f32(&needle, size, args.threshold)
+                    panic!("not implemented");
                 } else {
                     searcher.search_f32(&needle, size, args.threshold)
                 }
