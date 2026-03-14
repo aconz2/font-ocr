@@ -330,8 +330,8 @@ impl Searcher {
 
         let matches = Vec::with_capacity(1024);
         let matches_c = vec![MatchC::default(); MAX_MATCHES];
-        // big enough to keep 4 partial sums and 32 bytes extra to align
-        let acc_u32 = vec![0; img.width() as usize * 4 + 8];
+        // big enough to keep 8 partial sums (for 16) and 32 bytes extra to align
+        let acc_u32 = vec![0; img.width() as usize * 8 + 8];
         let needle_f32 = vec![0.; 128];
         let needle_u8 = vec![0; 128];
         let last_patch_size = None;
