@@ -81,6 +81,8 @@ extern "C" size_t ncc_8_u8(
     __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
     __m256d vthreshold = _mm256_set1_pd(threshold);
 
+    const size_t B = 4;
+
     auto processv = [&out_cur, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, size_t y) {
         // acc - s_p * s_n * (1 / n)
         /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
@@ -109,7 +111,64 @@ extern "C" size_t ncc_8_u8(
         // needle gets replicated across both halfs so we can search at x and x+8 at the same time
         // acc gets pairs of 4 partial sums from (x, x+8) in a row, then the tail handling is as normal
         // on the last row of the needle, we accumulate the sums
-        for (size_t needle_y = 0; needle_y < n_h; needle_y++) {
+
+        size_t needle_y = 0;
+        // 4 rows of needle at a time, dual wide then single
+        for (; needle_y + B < n_h; needle_y += B) {
+            __m256i n[B];
+            for (size_t i = 0; i < B; i++) {
+                __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[(needle_y + i) * 8]));
+                n[i] = _mm256_set_m128i(n_8, n_8);
+            }
+            size_t x = start;
+            size_t acc_i = 0;
+            for (; x + (8 * 2) < end; x += (8 * 2)) {
+                for (size_t j = 0; j < 8; j++) {
+                    __m256i nr[B];
+                    for (size_t i = 0; i < B; i++) {
+                        __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y + i) * r_w + x + j]));
+                        nr[i] = _mm256_madd_epi16(n[i], r); // 8 32 bit partial sums
+                    }
+                    __m256i s = _mm256_add_epi32(_mm256_add_epi32(nr[0], nr[1]), _mm256_add_epi32(nr[2], nr[3]));
+                    auto a = acc + acc_i;
+                    if (needle_y == 0) {
+                        _mm256_store_si256((__m256i*)a, s);
+                    } else if (needle_y + 1 == n_h - 1) {
+                        s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
+                        s = u32_4_2_sum(s);
+                        _mm256_store_si256((__m256i*)a, s);
+                    } else {
+                        s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
+                        _mm256_store_si256((__m256i*)a, s);
+                    }
+                    acc_i += 8;
+                }
+            }
+            for (; x < end; x++) {
+                __m128i nr[B];
+                for (size_t i = 0; i < B; i++) {
+                    __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[(y + needle_y) * 8]));
+                    __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y + i) * r_w + x]));
+                    nr[i] = _mm_madd_epi16(n_8, r);
+                }
+                __m128i s = _mm_add_epi32(_mm_add_epi32(nr[0], nr[1]), _mm_add_epi32(nr[2], nr[3]));
+                auto a = acc + acc_i;
+                if (needle_y == 0) {
+                    _mm_store_si128((__m128i*)a, s);
+                } else if (needle_y == n_h - 1) {
+                    s = _mm_add_epi32(s, _mm_load_si128((__m128i*)a));
+                    s = u32_4_sum(s);
+                    _mm_store_si128((__m128i*)a, s);
+                } else {
+                    s = _mm_add_epi32(s, _mm_load_si128((__m128i*)a));
+                    _mm_store_si128((__m128i*)a, s);
+                }
+                acc_i += 4;
+            }
+        }
+
+        // single rows of needle, dual wide then single
+        for (; needle_y < n_h; needle_y++) {
             __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * 8]));
             __m256i n = _mm256_set_m128i(n_8, n_8);
             size_t x = start;
@@ -280,11 +339,41 @@ extern "C" size_t ncc_16_u8(
         return false;
     };
 
+    const size_t B = 4;
+
     for (size_t y = 1; y < y_searches; y++) {
         const uint16_t start = start_end[y * 2 + 0];
         const uint16_t end = start_end[y * 2 + 1];
 
-        for (size_t needle_y = 0; needle_y < n_h; needle_y++) {
+        size_t needle_y = 0;
+        for (; needle_y + B < n_h; needle_y += B) {
+            __m256i n[B];
+            for (size_t i = 0; i < B; i++) {
+                n[i] = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&needle_u8[(needle_y + i) * 16]));
+            }
+            size_t acc_i = 0;
+            for (size_t x = start; x < end; x++) {
+                __m256i nr[B];
+                for (size_t i = 0; i < B; i++) {
+                    __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y + i) * r_w + x]));
+                    nr[i] = _mm256_madd_epi16(n[i], r); // 8 32 bit partial sums
+                }
+                __m256i s = _mm256_add_epi32(_mm256_add_epi32(nr[0], nr[1]), _mm256_add_epi32(nr[2], nr[3]));
+                auto a = acc + acc_i;
+                if (needle_y == 0) {
+                    _mm256_store_si256((__m256i*)a, s);
+                } else if (needle_y == n_h - 1) {
+                    s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
+                    __m128i s128 = u32_8_sum(s);
+                    _mm_store_si128((__m128i*)a, s128);
+                } else {
+                    s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
+                    _mm256_store_si256((__m256i*)a, s);
+                }
+                acc_i += 8;
+            }
+        }
+        for (; needle_y < n_h; needle_y++) {
             __m256i n_16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&needle_u8[needle_y * 16]));
             size_t acc_i = 0;
             for (size_t x = start; x < end; x++) {
