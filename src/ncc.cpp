@@ -4,11 +4,17 @@
 #include <immintrin.h>
 
 struct Match {
-    uint32_t x, y;
+    uint16_t x, y;
     float similarity;
 };
 
 static inline __m128i u32_4_sum(__m128i v) {
+    //  3  2  1  0
+    //  d  c  b  a
+    //  c  d  a  b  (2 3 0 1)
+    // cd cd ab ab
+    // ab ab cd cd  (1 0 3 2)
+    //        abcd
     v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
     v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
     return v;
@@ -95,7 +101,7 @@ extern "C" size_t ncc_8_u8(
         for (size_t i = 0; i < 4; i++) {
             if ((1 << i) & mask) {
                 float sim_ = sim[i]; // TIL you can index into the lane
-                *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, sim_};
+                *out_cur++ = {(uint16_t)(x + i), (uint16_t)y, sim_};
                 if (out_cur == out_fin) {
                     return true;
                 }
@@ -133,7 +139,7 @@ extern "C" size_t ncc_8_u8(
                     auto a = acc + acc_i;
                     if (needle_y == 0) {
                         _mm256_store_si256((__m256i*)a, s);
-                    } else if (needle_y + 1 == n_h - 1) {
+                    } else if (needle_y + B == n_h - 1) {
                         s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
                         s = u32_4_2_sum(s);
                         _mm256_store_si256((__m256i*)a, s);
@@ -155,7 +161,7 @@ extern "C" size_t ncc_8_u8(
                 auto a = acc + acc_i;
                 if (needle_y == 0) {
                     _mm_store_si128((__m128i*)a, s);
-                } else if (needle_y == n_h - 1) {
+                } else if (needle_y + B == n_h - 1) {
                     s = _mm_add_epi32(s, _mm_load_si128((__m128i*)a));
                     s = u32_4_sum(s);
                     _mm_store_si128((__m128i*)a, s);
@@ -265,7 +271,7 @@ extern "C" size_t ncc_8_u8(
             double den = rnorm_n * patch_rnorm[y * r_w + x];
             double similarity = num * den;
             if (similarity > threshold_d) {
-                *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
+                *out_cur++ = {(uint16_t)x, (uint16_t)y, (float)similarity};
                 return n_out;
             }
             acc_i += 4;
@@ -330,7 +336,7 @@ extern "C" size_t ncc_16_u8(
         for (size_t i = 0; i < 4; i++) {
             if ((1 << i) & mask) {
                 float sim_ = sim[i]; // TIL you can index into the lane
-                *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, sim_};
+                *out_cur++ = {(uint16_t)(x + i), (uint16_t)y, sim_};
                 if (out_cur == out_fin) {
                     return true;
                 }
@@ -417,7 +423,7 @@ extern "C" size_t ncc_16_u8(
             double den = rnorm_n * patch_rnorm[y * r_w + x];
             double similarity = num * den;
             if (similarity > threshold_d) {
-                *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
+                *out_cur++ = {(uint16_t)x, (uint16_t)y, (float)similarity};
                 return n_out;
             }
             acc_i += 4;
@@ -483,7 +489,7 @@ extern "C" size_t ncc_16_u8_7b(
         for (size_t i = 0; i < 4; i++) {
             if ((1 << i) & mask) {
                 float sim_ = sim[i]; // TIL you can index into the lane
-                *out_cur++ = {(uint32_t)(x + i), (uint32_t)y, sim_};
+                *out_cur++ = {(uint16_t)(x + i), (uint16_t)y, sim_};
                 if (out_cur == out_fin) {
                     return true;
                 }
@@ -552,7 +558,7 @@ extern "C" size_t ncc_16_u8_7b(
             double den = rnorm_n * patch_rnorm[y * r_w + x];
             double similarity = num * den;
             if (similarity > threshold_d) {
-                *out_cur++ = {(uint32_t)x, (uint32_t)y, (float)similarity};
+                *out_cur++ = {(uint16_t)x, (uint16_t)y, (float)similarity};
                 return n_out;
             }
             acc_i += 4;

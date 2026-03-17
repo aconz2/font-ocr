@@ -65,8 +65,8 @@ struct Match {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct MatchC {
-    x: u32,
-    y: u32,
+    x: u16,
+    y: u16,
     similarity: f32,
 }
 
