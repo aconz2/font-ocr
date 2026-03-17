@@ -647,6 +647,7 @@ impl Searcher {
                 }
             }
             for (x, acc) in (start..end).zip(self.acc_u32.iter()) {
+                eprintln!("y={y} x={x} acc={acc}");
                 let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
                 let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
                 if s_p == 0 {
@@ -671,6 +672,7 @@ impl Searcher {
                 //max_sim = f32::max(max_sim, similarity);
                 //min_sim = f32::min(max_sim, similarity);
                 if similarity_f64 > threshold as f64 {
+                    eprintln!("y={y} x={x} hit");
                     let rect = RectI::new(
                         Vector2I::new(x as i32, y as i32),
                         Vector2I::new(n_w as i32, n_h as i32),
@@ -910,20 +912,14 @@ fn main() {
             let _bearing_y = glyph_bounds.origin().y() + glyph_bounds.height();
             let bearing_x = glyph_bounds.origin().x();
             let _ascent_px = font.metrics().ascent * (1. / units_per_em) * render_options.size;
-            let mut last_rect = RectI::default();
             let mut non_overlapping_hits = 0;
             for hit in hits {
-                if hit.rect.intersects(last_rect) {
-                    continue;
-                }
                 non_overlapping_hits += 1;
                 all_hits.push(MatchWithBaseline {
                     similarity: hit.similarity,
                     rect: hit.rect,
                     baseline: corrected_offset[1],
                 });
-                last_rect = hit.rect;
-                //total_error += hit.error;
                 let ul = hit.rect.origin();
                 let pt = hit.rect.to_f32().center();
                 println!(
