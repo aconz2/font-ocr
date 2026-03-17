@@ -12,7 +12,6 @@ use pathfinder_geometry::rect::{RectF, RectI};
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
 
-
 // we calculate NCC, which is normally
 //     (x-x') (y-y')
 // ---------------------
@@ -139,7 +138,6 @@ struct MatchWithBaseline {
     baseline: f32,
 }
 
-type PixelType = f32;
 type AccType = u32;
 type SumTableT = u32;
 type SumSqrTableT = u64;
@@ -155,7 +153,6 @@ struct Searcher {
     sum_table_7b: Array2<SumTableT>,
     sumsqr_table_7b: Array2<SumSqrTableT>,
     acc_u32: Vec<u32>,
-    needle_f32: Vec<f32>,
     needle_u8: Vec<u8>,
     matches: Vec<Match>,
     matches_c: Vec<MatchC>,
@@ -370,7 +367,6 @@ impl Searcher {
         let matches_c = vec![MatchC::default(); MAX_MATCHES];
         // big enough to keep 8 partial sums (for 16) and 32 bytes extra to align
         let acc_u32 = vec![0; img.width() as usize * 8 + 8];
-        let needle_f32 = vec![0.; 128];
         let needle_u8 = vec![0; 128];
         let last_patch_size = None;
         let start_end = vec![0; img.height() as usize * 2];
@@ -384,7 +380,6 @@ impl Searcher {
             sum_table_7b,
             sumsqr_table_7b,
             needle_u8,
-            needle_f32,
             acc_u32,
             matches,
             matches_c,
@@ -458,19 +453,6 @@ impl Searcher {
         self.last_patch_size = Some((size, b7));
     }
 
-    fn search_f32(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
-        self.prepare_for_size(size, false);
-        let w = size.x();
-        if w <= 8 {
-            self.search_n_f32::<8>(needle, size, threshold)
-        } else if w <= 16 {
-            // TODO this isn't generating avx2 for some reason
-            self.search_n_f32::<16>(needle, size, threshold)
-        } else {
-            todo!()
-        }
-    }
-
     fn search_u8(&mut self, needle: &[u8], size: Vector2I, threshold: f32) -> &[Match] {
         self.prepare_for_size(size, false);
         let w = size.x();
@@ -520,7 +502,8 @@ impl Searcher {
             }
             self.matches.clear();
             for m in self.matches_c.iter().take(n_matches) {
-                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
+                self.matches
+                    .push(Match::from_matchc(*m, n_w as u32, n_h as u32));
             }
             &self.matches
         } else if n_w <= 16 {
@@ -554,7 +537,8 @@ impl Searcher {
             }
             self.matches.clear();
             for m in self.matches_c.iter().take(n_matches) {
-                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
+                self.matches
+                    .push(Match::from_matchc(*m, n_w as u32, n_h as u32));
             }
             &self.matches
         } else {
@@ -600,109 +584,13 @@ impl Searcher {
             }
             self.matches.clear();
             for m in self.matches_c.iter().take(n_matches) {
-                self.matches.push(Match::from_matchc(*m, n_w as u32, n_h as u32));
+                self.matches
+                    .push(Match::from_matchc(*m, n_w as u32, n_h as u32));
             }
             &self.matches
         } else {
             todo!()
         }
-    }
-
-    // note that we skip the first row and col of reference to make the indexing easier
-    //
-    // and because the needle is padded up to N, we won't search the last N - needle.width()
-    // cols
-    #[inline(never)]
-    fn search_n_f32<const N: usize>(
-        &mut self,
-        needle: &[u8],
-        size: Vector2I,
-        threshold: f32,
-    ) -> &[Match] {
-        assert!(size.x() <= N as i32);
-        self.matches.clear();
-
-        let n_h = size.y() as usize;
-        let n_w = size.x() as usize;
-
-        let (r_w, r_h) = (self.reference_f32.cols, self.reference_f32.rows);
-
-        let x_searches = r_w - N + 1;
-        let y_searches = r_h - n_h + 1;
-
-        let mut min_sim = f32::INFINITY;
-        let mut max_sim = -f32::INFINITY;
-
-        self.acc_u32.resize(x_searches - 1, AccType::default());
-
-        self.needle_f32.resize(N * n_h, PixelType::default());
-        {
-            let (rows, _rem) = self.needle_f32.as_chunks_mut::<N>();
-            copy_needle_n_f32(rows, needle, size);
-        }
-        let (needle_buf, _rem) = self.needle_f32.as_chunks::<N>();
-
-        let n = n_w * n_h;
-
-        // sum_needle sumsqr_needle
-        let (s_n, s2_n) = image_sum_sumsqr(needle);
-        if s_n == 0 {
-            return &self.matches;
-        }
-
-        for y in 1..y_searches {
-            for (needle_y, needle_row) in needle_buf.iter().enumerate() {
-                let row = self.reference_f32.get_row(y + needle_y);
-                let ref_windows = row[1..].array_windows::<N>();
-                for (x, (acc, ref_row)) in self.acc_u32.iter_mut().zip(ref_windows).enumerate() {
-                    // x is offset by 1
-                    let x = x + 1;
-                    if self.patch_sum[(x, y)] == 0 {
-                        continue;
-                    }
-                    if needle_y == 0 {
-                        *acc = cross_corr_n_f32(*needle_row, *ref_row) as u32;
-                    } else {
-                        *acc += cross_corr_n_f32(*needle_row, *ref_row) as u32;
-                    }
-                }
-            }
-            for (x, acc) in self.acc_u32.iter().enumerate() {
-                // x is offset by 1
-                let x = x + 1;
-                //let s_p = ncc_sum_table_sum(&self.sum_table, (x, y), (n_w, n_h));
-                let s_p = self.patch_sum[(x, y)];
-                let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
-                if s_p == 0 {
-                    continue;
-                }
-                let num = *acc as f64 - (s_n as u64 * s_p as u64) as f64 / n as f64;
-                if num < 0. {
-                    continue;
-                }
-                let norm2_n = s2_n as f64 - (s_n as u64 * s_n as u64) as f64 / n as f64;
-                let norm2_p = s2_p as f64 - (s_p as u64 * s_p as u64) as f64 / n as f64;
-                debug_assert!(norm2_n > 0.);
-                debug_assert!(norm2_p > 0.);
-                let den = (norm2_n * norm2_p).sqrt();
-                let similarity = (num / den) as f32;
-                debug_assert!(
-                    similarity >= -1.01 && similarity <= 1.01,
-                    "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}"
-                );
-                max_sim = f32::max(max_sim, similarity);
-                min_sim = f32::min(max_sim, similarity);
-                if similarity > threshold {
-                    let rect = RectI::new(
-                        Vector2I::new(x as i32, y as i32),
-                        Vector2I::new(n_w as i32, n_h as i32),
-                    );
-                    self.matches.push(Match { similarity, rect });
-                }
-            }
-        }
-        eprintln!("max sim {max_sim} min sim {min_sim}");
-        &self.matches
     }
 
     #[inline(never)]
@@ -742,7 +630,6 @@ impl Searcher {
         if s_n == 0 {
             return &self.matches;
         }
-
 
         for y in 1..y_searches {
             let start = self.start_end[y * 2] as usize;
@@ -838,9 +725,6 @@ struct Args {
 
     #[arg(long)]
     c: bool,
-
-    #[arg(long)]
-    u8: bool,
 
     #[arg(long)]
     batch: bool,
@@ -1001,22 +885,14 @@ fn main() {
                     .save(format!("letters/{letter}-{x}_{y}.png"))
                     .unwrap();
             }
-            let hits = if args.u8 {
-                if args.c {
-                    if args.seven {
-                        searcher.search_c_u8_7b(&needle, size, args.threshold)
-                    } else {
-                        searcher.search_c_u8(&needle, size, args.threshold)
-                    }
+            let hits = if args.c {
+                if args.seven {
+                    searcher.search_c_u8_7b(&needle, size, args.threshold)
                 } else {
-                    searcher.search_u8(&needle, size, args.threshold)
+                    searcher.search_c_u8(&needle, size, args.threshold)
                 }
             } else {
-                if args.c {
-                    panic!("not implemented");
-                } else {
-                    searcher.search_f32(&needle, size, args.threshold)
-                }
+                searcher.search_u8(&needle, size, args.threshold)
             };
             let t1 = Instant::now();
             eprintln!(
@@ -1136,8 +1012,14 @@ fn image_to_u8(img: &GrayImage) -> Array2<u8> {
 
 fn image_to_u8_7b(img: &Array2<u8>) -> Array2<u8> {
     let mut data = img.data.clone();
-    data.iter_mut().for_each(|x| { *x /= 2; });
-    Array2 { data, rows: img.rows, cols: img.cols }
+    data.iter_mut().for_each(|x| {
+        *x /= 2;
+    });
+    Array2 {
+        data,
+        rows: img.rows,
+        cols: img.cols,
+    }
 }
 
 fn canvas_to_u8(canvas: &Canvas) -> Vec<u8> {
@@ -1163,14 +1045,6 @@ fn cross_corr_n_u8<const N: usize>(a: [u8; N], b: [u8; N]) -> u32 {
     ret
 }
 
-fn cross_corr_n_f32<const N: usize>(a: [f32; N], b: [f32; N]) -> f32 {
-    let mut ret = 0f32;
-    for i in 0..N {
-        ret += a[i] * b[i];
-    }
-    ret
-}
-
 fn canvas_to_lum8(canvas: &Canvas) -> GrayImage {
     assert!(canvas.format == Format::A8);
     let w = canvas.size.x() as u32;
@@ -1187,18 +1061,6 @@ fn copy_needle_n_u8<const N: usize>(out: &mut [[u8; N]], needle: &[u8], size: Ve
         }
         for x in w..N {
             out[y][x] = 0;
-        }
-    }
-}
-
-fn copy_needle_n_f32<const N: usize>(out: &mut [[f32; N]], needle: &[u8], size: Vector2I) {
-    let w = size.x() as usize;
-    for y in 0..(size.y() as usize) {
-        for x in 0..w {
-            out[y][x] = needle[y * w + x] as f32;
-        }
-        for x in w..N {
-            out[y][x] = 0.;
         }
     }
 }
