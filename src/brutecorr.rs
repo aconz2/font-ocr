@@ -89,6 +89,7 @@ unsafe extern "C" {
         n_w: usize,
         n_h: usize,
         acc: *mut u32,
+        acc_len: usize,
         patch_sum: *const u32,
         patch_rnorm: *const f64,
         start_end: *const u16,
@@ -105,6 +106,7 @@ unsafe extern "C" {
         n_w: usize,
         n_h: usize,
         acc: *mut u32,
+        acc_len: usize,
         patch_sum: *const u32,
         patch_rnorm: *const f64,
         start_end: *const u16,
@@ -121,6 +123,7 @@ unsafe extern "C" {
         n_w: usize,
         n_h: usize,
         acc: *mut u32,
+        acc_len: usize,
         patch_sum: *const u32,
         patch_rnorm: *const f64,
         start_end: *const u16,
@@ -489,6 +492,7 @@ impl Searcher {
                     n_w,
                     n_h,
                     self.acc_u32.as_mut_ptr(),
+                    self.acc_u32.len(),
                     self.patch_sum.data.as_ptr(),
                     self.patch_rnorm.data.as_ptr(),
                     self.start_end.as_ptr(),
@@ -524,6 +528,7 @@ impl Searcher {
                     n_w,
                     n_h,
                     self.acc_u32.as_mut_ptr(),
+                    self.acc_u32.len(),
                     self.patch_sum.data.as_ptr(),
                     self.patch_rnorm.data.as_ptr(),
                     self.start_end.as_ptr(),
@@ -571,6 +576,7 @@ impl Searcher {
                     n_w,
                     n_h,
                     self.acc_u32.as_mut_ptr(),
+                    self.acc_u32.len(),
                     self.patch_sum.data.as_ptr(),
                     self.patch_rnorm.data.as_ptr(),
                     self.start_end.as_ptr(),
@@ -647,7 +653,6 @@ impl Searcher {
                 }
             }
             for (x, acc) in (start..end).zip(self.acc_u32.iter()) {
-                eprintln!("y={y} x={x} acc={acc}");
                 let s_p = ncc_sum_table_sum_nz(&self.sum_table, (x, y), (n_w, n_h));
                 let s2_p = ncc_sumsqr_table_sum_nz(&self.sumsqr_table, (x, y), (n_w, n_h));
                 if s_p == 0 {
@@ -672,7 +677,6 @@ impl Searcher {
                 //max_sim = f32::max(max_sim, similarity);
                 //min_sim = f32::min(max_sim, similarity);
                 if similarity_f64 > threshold as f64 {
-                    eprintln!("y={y} x={x} hit");
                     let rect = RectI::new(
                         Vector2I::new(x as i32, y as i32),
                         Vector2I::new(n_w as i32, n_h as i32),

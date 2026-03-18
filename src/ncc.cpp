@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <math.h>
+#include <string.h>
 #include <immintrin.h>
 
 struct Match {
@@ -52,6 +53,7 @@ extern "C" size_t ncc_8_u8(
     size_t n_w,
     size_t n_h,
     uint32_t* acc,
+    size_t acc_len,
     uint32_t* patch_sum,
     double* patch_rnorm,
     uint16_t* start_end,
@@ -62,6 +64,7 @@ extern "C" size_t ncc_8_u8(
     Match* out_cur = out;
     Match* out_fin = out + n_out;
 
+    memset(acc, 0, sizeof(uint32_t) * acc_len);
     acc = (uint32_t*)align_to((uintptr_t)acc, 32);
 
     size_t n = n_w * n_h;
@@ -87,6 +90,8 @@ extern "C" size_t ncc_8_u8(
     __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
     __m256d vthreshold = _mm256_set1_pd(threshold);
     __m256d vinf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
+    __m256i zero256 = _mm256_set1_epi8(0);
+    __m128i zero128 = _mm_set1_epi8(0);
 
     const size_t B = 4;
 
@@ -134,7 +139,7 @@ extern "C" size_t ncc_8_u8(
                 nn[i] = _mm256_set_m128i(n_8, n_8);
             }
             size_t x = start;
-            size_t acc_i = 0;
+            uint32_t* a = acc;
             for (; x + (8 * 2) < end; x += (8 * 2)) {
                 for (size_t j = 0; j < 8; j++) {
                     __m256i nr[B];
@@ -143,14 +148,9 @@ extern "C" size_t ncc_8_u8(
                         nr[i] = _mm256_madd_epi16(nn[i], r); // 8 32 bit partial sums
                     }
                     __m256i s = _mm256_add_epi32(_mm256_add_epi32(nr[0], nr[1]), _mm256_add_epi32(nr[2], nr[3]));
-                    auto a = acc + acc_i;
-                    if (needle_y == 0) {
-                        _mm256_store_si256((__m256i*)a, s);
-                    } else {
-                        s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
-                        _mm256_store_si256((__m256i*)a, s);
-                    }
-                    acc_i += 8;
+                    s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
+                    _mm256_store_si256((__m256i*)a, s);
+                    a += 8;
                 }
             }
             for (; x < end; x++) {
@@ -160,14 +160,9 @@ extern "C" size_t ncc_8_u8(
                     nr[i] = _mm_madd_epi16(n[i], r);
                 }
                 __m128i s = _mm_add_epi32(_mm_add_epi32(nr[0], nr[1]), _mm_add_epi32(nr[2], nr[3]));
-                auto a = acc + acc_i;
-                if (needle_y == 0) {
-                    _mm_store_si128((__m128i*)a, s);
-                } else {
-                    s = _mm_add_epi32(s, _mm_load_si128((__m128i*)a));
-                    _mm_store_si128((__m128i*)a, s);
-                }
-                acc_i += 4;
+                s = _mm_add_epi32(s, _mm_load_si128((__m128i*)a));
+                _mm_store_si128((__m128i*)a, s);
+                a += 4;
             }
         }
 
@@ -176,36 +171,35 @@ extern "C" size_t ncc_8_u8(
             __m128i n_8 = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&needle_u8[needle_y * 8]));
             __m256i n = _mm256_set_m128i(n_8, n_8);
             size_t x = start;
-            size_t acc_i = 0;
+            uint32_t* a = acc;
             for (; x + (8 * 2) < end; x += (8 * 2)) {
                 for (size_t j = 0; j < 8; j++) {
                     __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
                     __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
-                    auto a = acc + acc_i;
                     nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
                     _mm256_store_si256((__m256i*)a, nr);
-                    acc_i += 8;
+                    a += 8;
                 }
             }
             for (; x < end; x++) {
                 __m128i r = _mm_cvtepu8_epi16(_mm_loadu_si64((__m128i*)&reference[(y + needle_y) * r_w + x]));
                 __m128i nr = _mm_madd_epi16(n_8, r); // 4 32 bit partial sums
-                auto a = acc + acc_i;
                 nr = _mm_add_epi32(nr, _mm_load_si128((__m128i*)a));
                 _mm_store_si128((__m128i*)a, nr);
-                acc_i += 4;
+                a += 4;
             }
         }
 
         size_t x = start;
-        size_t acc_i = 0;
+        uint32_t* a = acc;
         for (; x + (8 * 2) < end; x += (8 * 2)) {
             __m256i A[8];
             // A holds acc sums in lo-hi lane pairs for 0,8 1,9 2,10 ... 7,15
             for (size_t i = 0; i < 8; i++) {
-                A[i] = u32_4_2_sum(_mm256_load_si256((__m256i*)&acc[acc_i + i * 8]));
+                A[i] = u32_4_2_sum(_mm256_load_si256((__m256i*)a));
+                _mm256_store_si256((__m256i*)a, zero256);
+                a += 8;
             }
-            acc_i += 8 * 8;
 
             // we want to shuffle these into 4 32bit sums to then expand into doubles in order
             // (these diagrams are mirrored from lane layout)
@@ -245,7 +239,8 @@ extern "C" size_t ncc_8_u8(
 
         for (; x < end; x++) {
             // acc is really 4 wide but we already summed on the last loop
-            uint32_t acc_ = _mm_extract_epi32(u32_4_sum(_mm_load_si128((__m128i*)&acc[acc_i])), 0);
+            uint32_t acc_ = _mm_extract_epi32(u32_4_sum(_mm_load_si128((__m128i*)a)), 0);
+            _mm_store_si128((__m128i*)a, zero128);
             uint32_t s_p = patch_sum[y * r_w + x];
             double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
             double den = rnorm_n * patch_rnorm[y * r_w + x];
@@ -254,7 +249,7 @@ extern "C" size_t ncc_8_u8(
                 *out_cur++ = {(uint16_t)x, (uint16_t)y, (float)similarity};
                 return n_out;
             }
-            acc_i += 4;
+            a += 4;
         }
     }
 
@@ -269,6 +264,7 @@ extern "C" size_t ncc_16_u8(
     size_t n_w,
     size_t n_h,
     uint32_t* acc,
+    size_t acc_len,
     uint32_t* patch_sum,
     double* patch_rnorm,
     uint16_t* start_end,
@@ -279,6 +275,7 @@ extern "C" size_t ncc_16_u8(
     Match* out_cur = out;
     Match* out_fin = out + n_out;
 
+    memset(acc, 0, sizeof(uint32_t) * acc_len);
     acc = (uint32_t*)align_to((uintptr_t)acc, 32);
 
     size_t n = n_w * n_h;
@@ -422,6 +419,7 @@ extern "C" size_t ncc_16_u8_7b(
     size_t n_w,
     size_t n_h,
     uint32_t* acc,
+    size_t acc_len,
     uint32_t* patch_sum,
     double* patch_rnorm,
     uint16_t* start_end,
@@ -432,6 +430,7 @@ extern "C" size_t ncc_16_u8_7b(
     Match* out_cur = out;
     Match* out_fin = out + n_out;
 
+    memset(acc, 0, sizeof(uint32_t) * acc_len);
     acc = (uint32_t*)align_to((uintptr_t)acc, 32);
 
     size_t n = n_w * n_h;
