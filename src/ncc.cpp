@@ -140,7 +140,7 @@ extern "C" size_t ncc_8_u8(
             }
             size_t x = start;
             uint32_t* a = acc;
-            for (; x + (8 * 2) < end; x += (8 * 2)) {
+            for (; x + (8 * 2) <= end; x += (8 * 2)) {
                 for (size_t j = 0; j < 8; j++) {
                     __m256i nr[B];
                     for (size_t i = 0; i < B; i++) {
@@ -172,7 +172,7 @@ extern "C" size_t ncc_8_u8(
             __m256i n = _mm256_set_m128i(n_8, n_8);
             size_t x = start;
             uint32_t* a = acc;
-            for (; x + (8 * 2) < end; x += (8 * 2)) {
+            for (; x + (8 * 2) <= end; x += (8 * 2)) {
                 for (size_t j = 0; j < 8; j++) {
                     __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x + j]));
                     __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
@@ -192,7 +192,7 @@ extern "C" size_t ncc_8_u8(
 
         size_t x = start;
         uint32_t* a = acc;
-        for (; x + (8 * 2) < end; x += (8 * 2)) {
+        for (; x + (8 * 2) <= end; x += (8 * 2)) {
             __m256i A[8];
             // A holds acc sums in lo-hi lane pairs for 0,8 1,9 2,10 ... 7,15
             for (size_t i = 0; i < 8; i++) {
@@ -336,7 +336,7 @@ extern "C" size_t ncc_16_u8(
         const uint16_t end = start_end[y * 2 + 1];
 
         size_t needle_y = 0;
-        for (; needle_y + B < n_h; needle_y += B) {
+        for (; needle_y + B <= n_h; needle_y += B) {
             __m256i n[B];
             for (size_t i = 0; i < B; i++) {
                 n[i] = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&needle_u8[(needle_y + i) * 16]));
@@ -454,15 +454,21 @@ extern "C" size_t ncc_16_u8_7b(
     __m256d vn_recip = _mm256_set1_pd(n_recip); // n recip
     __m256d vrnorm_n = _mm256_set1_pd(rnorm_n); // rnorm_n
     __m256d vthreshold = _mm256_set1_pd(threshold);
+    __m256d vinf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
+    __m256i zero256 = _mm256_set1_epi8(0);
 
-    auto processv = [&out_cur, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, size_t y) {
+    auto processv = [&out_cur, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold, vinf](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, size_t y) {
         // acc - s_p * s_n * (1 / n)
         /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
         __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc);
         // (1 / norm_n) * (1 / norm_patch)
         __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
         __m256d sim = _mm256_mul_pd(num, den);
-        int mask = _mm256_movemask_pd(_mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ));
+        int mask = _mm256_movemask_pd(
+                    _mm256_andnot_pd(
+                        _mm256_cmp_pd(sim, vinf, _CMP_EQ_OQ),
+                        _mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ)
+                    ));
         if (mask == 0) return false; // fast path for no hits
         for (size_t i = 0; i < 4; i++) {
             if ((1 << i) & mask) {
@@ -476,6 +482,8 @@ extern "C" size_t ncc_16_u8_7b(
         return false;
     };
 
+    const size_t B = 3;
+
     // UBS is actually slower
 /*#define UBS*/
 
@@ -483,43 +491,78 @@ extern "C" size_t ncc_16_u8_7b(
         const uint16_t start = start_end[y * 2 + 0];
         const uint16_t end = start_end[y * 2 + 1];
 
-        for (size_t needle_y = 0; needle_y < n_h; needle_y++) {
+        size_t needle_y = 0;
+        for (; needle_y + B <= n_h; needle_y += B) {
 #ifdef UBS
-            __m128i n_16 = _mm_loadu_si128((__m128i*)&needle_u8[needle_y * 16]);
+            __m128i n[B];
+            for (size_t i = 0; i < B; i++) {
+                n[i] = _mm_loadu_si128((__m128i*)&needle_u8[(needle_y + i) * 16]);
+            }
 #else
-            __m256i n_16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&needle_u8[needle_y * 16]));
+            __m256i n[B];
+            for (size_t i = 0; i < B; i++) {
+                n[i] = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&needle_u8[(needle_y + i) * 16]));
+            }
 #endif
-            size_t acc_i = 0;
+            uint32_t* a = acc;
             for (size_t x = start; x < end; x++) {
 #ifdef UBS
-                __m128i r = _mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]);
-                __m256i nr = _mm256_cvtepi16_epi32(_mm_maddubs_epi16(n_16, r));
-#else
-                __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]));
-                __m256i nr = _mm256_madd_epi16(n_16, r); // 8 32 bit partial sums
-#endif
-                auto a = acc + acc_i;
-                if (needle_y == 0) {
-                    _mm256_store_si256((__m256i*)a, nr);
-                } else if (needle_y == n_h - 1) {
-                    nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
-                    __m128i s = u32_8_sum(nr);
-                    _mm_store_si128((__m128i*)a, s);
-                } else {
-                    nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
-                    _mm256_store_si256((__m256i*)a, nr);
+                __m256i nr[B];
+                for (size_t i = 0; i < B; i++) {
+                    __m128i r = _mm_loadu_si128((__m128i*)&reference[(y + needle_y + i) * r_w + x]);
+                    nr[i] = _mm256_cvtepi16_epi32(_mm_maddubs_epi16(n[i], r));
                 }
-                acc_i += 8;
+#else
+                __m256i nr[B];
+                for (size_t i = 0; i < B; i++) {
+                    __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y + i) * r_w + x]));
+                    nr[i] = _mm256_madd_epi16(n[i], r); // 8 32 bit partial sums
+                }
+#endif
+                __m256i s;
+                if (B == 3) {
+                    s = _mm256_add_epi32(
+                            _mm256_add_epi32(nr[0], nr[1]),
+                            _mm256_add_epi32(nr[2], _mm256_load_si256((__m256i*)a))
+                        );
+                } else {
+                    s = _mm256_add_epi32(_mm256_add_epi32(nr[0], nr[1]), _mm256_add_epi32(nr[2], nr[3]));
+                    s = _mm256_add_epi32(s, _mm256_load_si256((__m256i*)a));
+
+                }
+                _mm256_store_si256((__m256i*)a, s);
+                a += 8;
+            }
+        }
+        for (; needle_y < n_h; needle_y++) {
+            __m256i n = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&needle_u8[needle_y * 16]));
+            uint32_t* a = acc;
+            for (size_t x = start; x < end; x++) {
+                __m256i r = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)&reference[(y + needle_y) * r_w + x]));
+                __m256i nr = _mm256_madd_epi16(n, r); // 8 32 bit partial sums
+                nr = _mm256_add_epi32(nr, _mm256_load_si256((__m256i*)a));
+                _mm256_store_si256((__m256i*)a, nr);
+                a += 8;
             }
         }
 
         size_t x = start;
-        size_t acc_i = 0;
-        for (; x + 4 < end; x += 4) {
-            // last loop trip above sums the 8 lanes down into the first 4 entries
-            __m128i vacc = _mm_set_epi32(acc[acc_i + 24], acc[acc_i + 16], acc[acc_i + 8], acc[acc_i]);
-            acc_i += 4 * 8;
-            __m256d vacc_d =_mm256_cvtepi32_pd(vacc);
+        uint32_t* a = acc;
+        for (; x + 4 <= end; x += 4) {
+            __m128i vacc[4];
+            for (size_t i = 0; i < 4; i++) {
+                vacc[i] = u32_8_sum(_mm256_load_si256((__m256i*)a));
+                _mm256_store_si256((__m256i*)a, zero256);
+                a += 8;
+
+            }
+            // pack each sum into [s3, s2, s1, s0]
+            __m128i vacc_ = _mm_blend_epi32(
+                    _mm_blend_epi32(vacc[0], vacc[1], 0b0010),
+                    _mm_blend_epi32(vacc[2], vacc[3], 0b1000),
+                    0b1100
+                    );
+            __m256d vacc_d =_mm256_cvtepi32_pd(vacc_);
             __m256d v_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x]));
             __m256d v_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x]);
             if (processv(vacc_d, v_s_p, v_rn_p, x, y)) {
@@ -527,19 +570,19 @@ extern "C" size_t ncc_16_u8_7b(
             }
         }
         for (; x < end; x++) {
-            uint32_t acc_ = 0;
-            for (size_t i = 0; i < 8; i ++) {
-                acc_ += acc[acc_i + i];
-            }
+            uint32_t acc_ = _mm_extract_epi32(u32_8_sum(_mm256_load_si256((__m256i*)a)), 0);
+            _mm256_store_si256((__m256i*)a, zero256);
+            a += 8;
             uint32_t s_p = patch_sum[y * r_w + x];
             double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
             double den = rnorm_n * patch_rnorm[y * r_w + x];
             double similarity = num * den;
-            if (similarity > threshold_d) {
+            if (similarity != std::numeric_limits<double>::infinity() && similarity > threshold_d) {
                 *out_cur++ = {(uint16_t)x, (uint16_t)y, (float)similarity};
-                return n_out;
+                if (out_cur == out_fin) {
+                    return n_out;
+                }
             }
-            acc_i += 4;
         }
     }
 

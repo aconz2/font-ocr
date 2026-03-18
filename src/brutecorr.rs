@@ -23,8 +23,9 @@ use pathfinder_geometry::vector::{Vector2F, Vector2I};
 // which can be calculated by sqrt(S2 - S**2/n)
 // where S2 is the sum of squares and S is the sum
 
+// _ underscore is a tricky character b/c it has no bottom whitespace and so wants to match lines
 const DEFAULT_ALPHABET: &str =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=+(){};:/_-";
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789=+<>(){};:/-";
 
 const MAX_MATCHES: usize = 1024;
 
@@ -617,9 +618,6 @@ impl Searcher {
         let x_searches = r_w - N + 1;
         let y_searches = r_h - n_h + 1;
 
-        //let mut min_sim = f32::INFINITY;
-        //let mut max_sim = -f32::INFINITY;
-
         self.acc_u32.resize(x_searches - 1, AccType::default());
 
         self.needle_u8.resize(N * n_h, 0);
@@ -674,9 +672,7 @@ impl Searcher {
                     similarity >= -1.01 && similarity <= 1.01,
                     "got bad similarity={similarity} norm2_n={norm2_n} norm2_p={norm2_p} acc={acc} num={num} s_n={s_n} s_p={s_p}"
                 );
-                //max_sim = f32::max(max_sim, similarity);
-                //min_sim = f32::min(max_sim, similarity);
-                if similarity_f64 > threshold as f64 {
+                if similarity_f64 != f64::INFINITY && similarity_f64 > threshold as f64 {
                     let rect = RectI::new(
                         Vector2I::new(x as i32, y as i32),
                         Vector2I::new(n_w as i32, n_h as i32),
@@ -685,7 +681,6 @@ impl Searcher {
                 }
             }
         }
-        //eprintln!("max sim {max_sim} min sim {min_sim}");
         &self.matches
     }
 }
@@ -721,10 +716,10 @@ struct Args {
     box_size: String,
 
     #[arg(long, default_value_t = 0)]
-    padding_x: usize,
+    x_padding: usize,
 
     #[arg(long, default_value_t = 0)]
-    padding_y: usize,
+    y_padding: usize,
 
     #[arg(long)]
     save_letters: bool,
@@ -742,7 +737,7 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let padding = Vector2I::new(args.padding_x as i32, args.padding_y as i32);
+    let padding = Vector2I::new(args.x_padding as i32, args.y_padding as i32);
 
     let hinting = if args.hinting {
         HintingOptions::Full(args.text_size)
