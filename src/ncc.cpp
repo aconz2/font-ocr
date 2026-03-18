@@ -238,16 +238,17 @@ extern "C" size_t ncc_8_u8(
         }
 
         for (; x < end; x++) {
-            // acc is really 4 wide but we already summed on the last loop
             uint32_t acc_ = _mm_extract_epi32(u32_4_sum(_mm_load_si128((__m128i*)a)), 0);
             _mm_store_si128((__m128i*)a, zero128);
             uint32_t s_p = patch_sum[y * r_w + x];
             double num = (double)acc_ - (double)((uint64_t)s_n * (uint64_t)s_p) * n_recip;
             double den = rnorm_n * patch_rnorm[y * r_w + x];
             double similarity = num * den;
-            if (similarity > threshold_d) {
+            if (similarity != std::numeric_limits<double>::infinity() && similarity > threshold_d) {
                 *out_cur++ = {(uint16_t)x, (uint16_t)y, (float)similarity};
-                return n_out;
+                if (out_cur == out_fin) {
+                    return n_out;
+                }
             }
             a += 4;
         }
