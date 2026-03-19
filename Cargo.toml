@@ -17,16 +17,8 @@ rayon = "1.11.0"
 cc = "1.0"
 
 [[bin]]
-name = "brute"
-path = "src/brute.rs"
-
-[[bin]]
-name = "brutecorr"
-path = "src/brutecorr.rs"
-
-[[bin]]
-name = "knn"
-path = "src/knn.rs"
+name = "ncc"
+path = "src/ncc.rs"
 
 [profile.release]
 debug = "line-tables-only"

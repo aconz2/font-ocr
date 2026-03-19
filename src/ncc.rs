@@ -797,11 +797,16 @@ fn main() {
     }
     for (i, j) in line_slices {
         let slice = &all_hits[i..j];
-        let duplicate_slices = partition_by(slice, |a, b| (a.rect.origin().x() - b.rect.origin().x()).abs() <= args.overlap);
+        let duplicate_slices = partition_by(slice, |a, b| {
+            (a.rect.origin().x() - b.rect.origin().x()).abs() <= args.overlap
+        });
         let mut dedup = vec![];
         for (i, j) in duplicate_slices {
             // this is slightly maddening
-            let m = slice[i..j].iter().max_by(|a, b| f32::total_cmp(&a.similarity, &b.similarity)).unwrap();
+            let m = slice[i..j]
+                .iter()
+                .max_by(|a, b| f32::total_cmp(&a.similarity, &b.similarity))
+                .unwrap();
             if args.verbose {
                 eprintln!("{:?} {m:?}", slice[i..j].iter().collect::<Vec<_>>());
             }
@@ -828,7 +833,16 @@ fn main() {
         for line in lines {
             for m in line {
                 let pt = m.rect.to_f32().center();
-                println!("{},{},{},{},{},{},{}", m.letter as usize, pt.x(), pt.y(), m.rect.origin().x(), m.rect.origin().y(), m.rect.width(), m.rect.height());
+                println!(
+                    "{},{},{},{},{},{},{}",
+                    m.letter as usize,
+                    pt.x(),
+                    pt.y(),
+                    m.rect.origin().x(),
+                    m.rect.origin().y(),
+                    m.rect.width(),
+                    m.rect.height()
+                );
             }
         }
     } else {
@@ -911,8 +925,8 @@ fn ncc_sum_table(pixels: &Array2<u8>) -> Array2<u32> {
     }
     for y in 1..pixels.rows {
         for x in 1..pixels.cols {
-            ret[(x, y)] = pixels[(x, y)] as u32 + ret[(x - 1, y)] + ret[(x, y - 1)]
-                - ret[(x - 1, y - 1)];
+            ret[(x, y)] =
+                pixels[(x, y)] as u32 + ret[(x - 1, y)] + ret[(x, y - 1)] - ret[(x - 1, y - 1)];
         }
     }
     ret
@@ -967,11 +981,7 @@ fn ncc_sum_table_sum_nz(s: &Array2<u32>, (x, y): (usize, usize), (w, h): (usize,
 //    (a - b + d - c) as u32
 //}
 
-fn ncc_sumsqr_table_sum_nz(
-    s: &Array2<u64>,
-    (x, y): (usize, usize),
-    (w, h): (usize, usize),
-) -> u64 {
+fn ncc_sumsqr_table_sum_nz(s: &Array2<u64>, (x, y): (usize, usize), (w, h): (usize, usize)) -> u64 {
     //s[(x + w - 1, y + h - 1)] - s[(x - 1, y + h - 1)] - s[(x + w - 1, y - 1)] + s[(x - 1, y - 1)]
     let a = s[(x + w - 1, y + h - 1)] as i64;
     let b = s[(x - 1, y + h - 1)] as i64;
@@ -1007,7 +1017,7 @@ fn partition_by<T>(xs: &[T], pred: impl Fn(&T, &T) -> bool) -> Vec<(usize, usize
     let mut j = 0;
     let mut last = it.next().unwrap();
     let mut slices = vec![];
-    while let Some(next) = it.next() {
+    for next in it {
         j += 1;
         if !pred(last, next) {
             slices.push((i, j));
@@ -1017,5 +1027,4 @@ fn partition_by<T>(xs: &[T], pred: impl Fn(&T, &T) -> bool) -> Vec<(usize, usize
     }
     slices.push((i, j + 1));
     slices
-
 }
