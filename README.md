@@ -40,3 +40,20 @@ I thought there should be a way to only render a small character-sized canvas an
 I made no attempts to cache rendered glyphs. This would work better if rendering to a character-sized canvas, though the cache would still need to be keyed off `(glyph, subpixel_position)` (is that what real renderers do?). In general, caching a glyph per position on the line is possible, but could get large in size if the font isn't monospace.
 
 There is no font shaping.
+
+# NCC
+
+There is another tool in `src/ncc.rs` that implements another approach using the normalized cross correlation for template matching .The kernel is written for AVX2 in `src/ncc.cpp`. It does not currently detect spaces. Underscore is also a problematic character to detect. This can handle text which has been rendered with (what I think is) grid snapping so the character advance is not consistent. You can use `--x-bits` and `--y-bits` to search against more bits of subpixel shifts (2 bits means it renders characters with offset 0, 0.25, 0.5, 0.75 pixels).
+
+The post-processing approach is roughly:
+
+1) get all matches above `--threshold` (default 0.8) (a value from 0 to 1 where 1 is perfect match)
+2) get all y positions for those matches above `--anchor-threshold` (default 0.95) -- this defines the line positions
+3) for each line, deduplicate matches by going from left to right and taking the match with highest similarity for those within `--overlap` pixels
+
+```bash
+# same example as above
+cargo run --bin ncc --release -- -i imgs/* -f Courier\ New.otf -t 13 --x-bits 2 > out.ncc
+# cleanup out.ncc file by removing garbage from beginning and end
+sed 's/>//' out | base64 -d > attachment.pdf
+```

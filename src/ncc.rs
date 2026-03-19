@@ -11,6 +11,7 @@ use image::GrayImage;
 use pathfinder_geometry::rect::{RectF, RectI};
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
+use rayon::prelude::*;
 
 // we calculate NCC, which is normally
 //     (x-x') (y-y')
@@ -482,7 +483,7 @@ impl Searcher {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long, num_args=1..)]
@@ -503,7 +504,7 @@ struct Args {
     #[arg(long)]
     hinting: bool,
 
-    #[arg(long, default_value_t = 0.75)]
+    #[arg(long, default_value_t = 0.8)]
     threshold: f32,
 
     #[arg(long, default_value_t = 0.95)]
@@ -528,10 +529,7 @@ struct Args {
     save_letters: bool,
 
     #[arg(long)]
-    c: bool,
-
-    #[arg(long)]
-    batch: bool,
+    rust: bool,
 
     #[arg(short, long)]
     verbose: bool,
@@ -543,9 +541,7 @@ struct Args {
     raw: bool,
 }
 
-fn main() {
-    let args = Args::parse();
-
+fn get_hits(args: &Args, image_index: usize) -> Vec<MatchWithLetter> {
     let padding = Vector2I::new(args.x_padding as i32, args.y_padding as i32);
 
     let hinting = if args.hinting {
@@ -562,6 +558,8 @@ fn main() {
     };
     let box_size = args.box_size.as_str().try_into().unwrap();
 
+    let font = Font::from_path(&args.font, 0).unwrap();
+
     let offsets = {
         let mut acc = vec![];
         let x_divisor = 1. / 2usize.pow(args.x_bits) as f32;
@@ -574,49 +572,7 @@ fn main() {
         acc
     };
 
-    let font = Font::from_path(args.font, 0).unwrap();
-
-    if args.verbose {
-        let metrics = font.metrics();
-        let to_px = (1. / metrics.units_per_em as f32) * args.text_size;
-        let font_bbox = metrics.bounding_box * to_px;
-        let line_space = metrics.ascent - metrics.descent + metrics.line_gap;
-        let line_space_px = line_space * to_px;
-        eprintln!("metrics {:?}", metrics);
-        eprintln!("ascent  {}px", metrics.ascent * to_px);
-        eprintln!("descent {}px", metrics.descent * to_px);
-        eprintln!("font_bbox size {:?}px", font_bbox.size());
-        eprintln!("line_space {} {}px", line_space, line_space_px);
-
-        for char in args.alphabet.chars() {
-            let glyph_id = font.glyph_for_char(char).unwrap();
-            let typo_bounds_px = font.typographic_bounds(glyph_id).unwrap() * to_px;
-            let advance = (font.advance(glyph_id).unwrap() * to_px).x();
-            let bearing_y = typo_bounds_px.origin().y() + typo_bounds_px.height();
-            let bearing_x = typo_bounds_px.origin().x();
-            if false {
-                eprintln!(
-                    "`{char}` {typo_bounds_px:?}px advance={advance} bearing_x={bearing_x} bearing_y={bearing_y}"
-                );
-            }
-        }
-
-        let alphabet_bbox = args.alphabet.chars().fold(RectF::default(), |bounds, c| {
-            let gid = font.glyph_for_char(c).unwrap();
-            let raster_rect = font
-                .raster_bounds(
-                    gid,
-                    render_options.size,
-                    Transform2F::default(),
-                    render_options.hinting,
-                    render_options.rasterization,
-                )
-                .unwrap();
-            bounds.union_rect(raster_rect.to_f32())
-        });
-        eprintln!("alphabet_bbox size {:?}", alphabet_bbox.size());
-    }
-    let img = image::open(args.img.first().unwrap()).unwrap().into_luma8();
+    let img = image::open(&args.img[image_index]).unwrap().into_luma8();
     let mut searcher = Searcher::new(&img);
     let mut n_hits = 0;
 
@@ -692,10 +648,10 @@ fn main() {
                     .unwrap();
             }
             let t0 = Instant::now();
-            let hits = if args.c {
-                searcher.search_c_u8(&needle, size, args.threshold)
-            } else {
+            let hits = if args.rust {
                 searcher.search_u8(&needle, size, args.threshold)
+            } else {
+                searcher.search_c_u8(&needle, size, args.threshold)
             };
             let t1 = Instant::now();
             if args.verbose {
@@ -761,42 +717,41 @@ fn main() {
         }
     }
 
-    if args.raw {
-        return;
-    }
+    all_hits
+}
 
-    let t0 = Instant::now();
-    let mut all_hits = {
+fn process_hits(args: &Args, all_hits: &[MatchWithLetter]) -> Vec<Vec<MatchWithLetter>> {
+    let mut hits = {
         use std::collections::HashSet;
         let mut keep_y = HashSet::with_capacity(512);
-        for h in &all_hits {
+        for h in all_hits {
             if h.similarity >= args.anchor_threshold {
                 keep_y.insert(h.rect.origin().y());
             }
         }
         let mut acc = vec![];
-        for h in &all_hits {
+        for h in all_hits {
             if keep_y.contains(&h.rect.origin().y()) {
-                acc.push(h);
+                acc.push(*h);
             }
         }
         acc
     };
-
-    all_hits.sort_by_key(|m| m.rect.origin().y());
+    let t0 = Instant::now();
+    hits.sort_by_key(|m| m.rect.origin().y());
     if args.verbose {
-        for hit in &all_hits {
+        for hit in &hits {
             eprintln!("{} {hit:?}", hit.rect.origin().y());
         }
     }
-    let line_slices = partition_by(&all_hits, |a, b| a.rect.origin().y() == b.rect.origin().y());
+    let line_slices = partition_by(&hits, |a, b| a.rect.origin().y() == b.rect.origin().y());
     let mut lines = vec![];
     for (i, j) in &line_slices {
-        let slice = &mut all_hits[*i..*j];
+        let slice = &mut hits[*i..*j];
         slice.sort_by_key(|m| m.rect.origin().x());
     }
     for (i, j) in line_slices {
-        let slice = &all_hits[i..j];
+        let slice = &hits[i..j];
         let duplicate_slices = partition_by(slice, |a, b| {
             (a.rect.origin().x() - b.rect.origin().x()).abs() <= args.overlap
         });
@@ -807,50 +762,117 @@ fn main() {
                 .iter()
                 .max_by(|a, b| f32::total_cmp(&a.similarity, &b.similarity))
                 .unwrap();
-            if args.verbose {
-                eprintln!("{:?} {m:?}", slice[i..j].iter().collect::<Vec<_>>());
-            }
-            dedup.push(m);
+            dedup.push(*m);
         }
-        let mut dx_counts = HashMap::with_capacity(16);
-        for [a, b] in dedup.array_windows::<2>() {
-            let dx = b.rect.origin().x() - a.rect.origin().x();
-            if let Some(c) = dx_counts.get_mut(&dx) {
-                *c += 1
-            } else {
-                dx_counts.insert(dx, 1);
-            }
-        }
-        lines.push(dedup);
         if args.verbose {
+            let mut dx_counts = HashMap::with_capacity(16);
+            for [a, b] in dedup.array_windows::<2>() {
+                let dx = b.rect.origin().x() - a.rect.origin().x();
+                if let Some(c) = dx_counts.get_mut(&dx) {
+                    *c += 1
+                } else {
+                    dx_counts.insert(dx, 1);
+                }
+            }
             eprintln!("{dx_counts:?}");
         }
-        println!();
+        lines.push(dedup);
     }
     let t1 = Instant::now();
-    eprintln!("processing took {}ms", (t1 - t0).as_millis());
-    if args.csv {
-        for line in lines {
-            for m in line {
-                let pt = m.rect.to_f32().center();
-                println!(
-                    "{},{},{},{},{},{},{}",
-                    m.letter as usize,
-                    pt.x(),
-                    pt.y(),
-                    m.rect.origin().x(),
-                    m.rect.origin().y(),
-                    m.rect.width(),
-                    m.rect.height()
+    if args.verbose {
+        eprintln!("processing took {}ms", (t1 - t0).as_millis());
+    }
+    lines
+}
+
+fn main() {
+    let args = Args::parse();
+
+    if args.verbose {
+        let font = Font::from_path(&args.font, 0).unwrap();
+        let metrics = font.metrics();
+        let to_px = (1. / metrics.units_per_em as f32) * args.text_size;
+        let font_bbox = metrics.bounding_box * to_px;
+        let line_space = metrics.ascent - metrics.descent + metrics.line_gap;
+        let line_space_px = line_space * to_px;
+        eprintln!("metrics {:?}", metrics);
+        eprintln!("ascent  {}px", metrics.ascent * to_px);
+        eprintln!("descent {}px", metrics.descent * to_px);
+        eprintln!("font_bbox size {:?}px", font_bbox.size());
+        eprintln!("line_space {} {}px", line_space, line_space_px);
+
+        for char in args.alphabet.chars() {
+            let glyph_id = font.glyph_for_char(char).unwrap();
+            let typo_bounds_px = font.typographic_bounds(glyph_id).unwrap() * to_px;
+            let advance = (font.advance(glyph_id).unwrap() * to_px).x();
+            let bearing_y = typo_bounds_px.origin().y() + typo_bounds_px.height();
+            let bearing_x = typo_bounds_px.origin().x();
+            if false {
+                eprintln!(
+                    "`{char}` {typo_bounds_px:?}px advance={advance} bearing_x={bearing_x} bearing_y={bearing_y}"
                 );
             }
         }
-    } else {
-        for line in lines {
-            for m in line {
-                print!("{}", m.letter);
+
+        //let alphabet_bbox = args.alphabet.chars().fold(RectF::default(), |bounds, c| {
+        //    let gid = font.glyph_for_char(c).unwrap();
+        //    let raster_rect = font
+        //        .raster_bounds(
+        //            gid,
+        //            render_options.size,
+        //            Transform2F::default(),
+        //            render_options.hinting,
+        //            render_options.rasterization,
+        //        )
+        //        .unwrap();
+        //    bounds.union_rect(raster_rect.to_f32())
+        //});
+        //eprintln!("alphabet_bbox size {:?}", alphabet_bbox.size());
+    }
+
+    if args.raw {
+        assert!(args.img.len() == 1);
+        get_hits(&args, 0);
+        return;
+    }
+
+    let mut pages: Vec<_> = (0..args.img.len())
+        .into_par_iter()
+        .map(|i| {
+            let hits = get_hits(&args, i);
+            let lines = process_hits(&args, &hits);
+            (i, lines)
+        })
+        .collect();
+    pages.sort_by_key(|(i, _)| *i);
+
+    if args.csv {
+        for (i, lines) in pages {
+            for line in lines {
+                for m in line {
+                    let pt = m.rect.to_f32().center();
+                    println!(
+                        "{},{},{},{},{},{},{},{}",
+                        i,
+                        m.letter as usize,
+                        pt.x(),
+                        pt.y(),
+                        m.rect.origin().x(),
+                        m.rect.origin().y(),
+                        m.rect.width(),
+                        m.rect.height()
+                    );
+                }
             }
-            println!();
+        }
+    } else {
+        for (_, lines) in pages {
+            for line in lines {
+                for m in line {
+                    print!("{}", m.letter);
+                }
+                println!();
+            }
         }
     }
 }
