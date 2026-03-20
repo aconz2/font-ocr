@@ -95,31 +95,6 @@ extern "C" size_t ncc_8_u8(
 
     const size_t B = 4;
 
-    auto processv = [&out_cur, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold, vinf](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, size_t y) {
-        // acc - s_p * s_n * (1 / n)
-        /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
-        __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc);
-        // (1 / norm_n) * (1 / norm_patch)
-        __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
-        __m256d sim = _mm256_mul_pd(num, den);
-        int mask = _mm256_movemask_pd(
-                    _mm256_andnot_pd(
-                        _mm256_cmp_pd(sim, vinf, _CMP_EQ_OQ),
-                        _mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ)
-                    ));
-        if (mask == 0) return false; // fast path for no hits
-        for (size_t i = 0; i < 4; i++) {
-            if ((1 << i) & mask) {
-                float sim_ = sim[i]; // TIL you can index into the lane
-                *out_cur++ = {(uint16_t)(x + i), (uint16_t)y, sim_};
-                if (out_cur == out_fin) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
-
     for (size_t y = 1; y < y_searches; y++) {
         const uint16_t start = start_end[y * 2 + 0];
         const uint16_t end = start_end[y * 2 + 1];
@@ -229,10 +204,28 @@ extern "C" size_t ncc_8_u8(
 
             // compute the similarity for each batch of 4
             for (size_t i = 0; i < 4; i++) {
-                __m256d v_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x + i * 4]));
-                __m256d v_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x + i * 4]);
-                if (processv(vacc[i], v_s_p, v_rn_p, x + i * 4, y)) {
-                    return n_out;
+                __m256d vs_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x + i * 4]));
+                __m256d vrn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x + i * 4]);
+
+                // acc - s_p * s_n * (1 / n)
+                /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
+                __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc[i]);
+                // (1 / norm_n) * (1 / norm_patch)
+                __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
+                __m256d sim = _mm256_mul_pd(num, den);
+                int mask = _mm256_movemask_pd(
+                            _mm256_andnot_pd(
+                                _mm256_cmp_pd(sim, vinf, _CMP_EQ_OQ),
+                                _mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ)
+                            ));
+                if (mask == 0) continue; // fast path for no hits
+                for (size_t j = 0; j < 4; j++) {
+                    if ((1 << j) & mask) {
+                        *out_cur++ = {(uint16_t)(x + i * 4 + j), (uint16_t)y, (float)sim[j]};
+                        if (out_cur == out_fin) {
+                            return n_out;
+                        }
+                    }
                 }
             }
         }
@@ -304,31 +297,6 @@ extern "C" size_t ncc_16_u8(
     __m256d vinf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
     __m256i zero256 = _mm256_set1_epi8(0);
 
-    auto processv = [&out_cur, out_fin, vs_n, vn_recip, vrnorm_n, vthreshold, vinf](__m256d vacc, __m256d vs_p, __m256d vrn_p, size_t x, size_t y) {
-        // acc - s_p * s_n * (1 / n)
-        /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
-        __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc);
-        // (1 / norm_n) * (1 / norm_patch)
-        __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
-        __m256d sim = _mm256_mul_pd(num, den);
-        int mask = _mm256_movemask_pd(
-                    _mm256_andnot_pd(
-                        _mm256_cmp_pd(sim, vinf, _CMP_EQ_OQ),
-                        _mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ)
-                    ));
-        if (mask == 0) return false; // fast path for no hits
-        for (size_t i = 0; i < 4; i++) {
-            if ((1 << i) & mask) {
-                float sim_ = sim[i]; // TIL you can index into the lane
-                *out_cur++ = {(uint16_t)(x + i), (uint16_t)y, sim_};
-                if (out_cur == out_fin) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
-
     const size_t B = 4;
 
     for (size_t y = 1; y < y_searches; y++) {
@@ -374,7 +342,6 @@ extern "C" size_t ncc_16_u8(
                 vacc[i] = u32_8_sum(_mm256_load_si256((__m256i*)a));
                 _mm256_store_si256((__m256i*)a, zero256);
                 a += 8;
-
             }
             // pack each sum into [s3, s2, s1, s0]
             __m128i vacc_ = _mm_blend_epi32(
@@ -383,12 +350,31 @@ extern "C" size_t ncc_16_u8(
                     0b1100
                     );
             __m256d vacc_d =_mm256_cvtepi32_pd(vacc_);
-            __m256d v_s_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x]));
-            __m256d v_rn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x]);
-            if (processv(vacc_d, v_s_p, v_rn_p, x, y)) {
-                return n_out;
+            __m256d vs_p = _mm256_cvtepi32_pd(_mm_loadu_si128((__m128i*)&patch_sum[y * r_w + x]));
+            __m256d vrn_p = _mm256_loadu_pd(&patch_rnorm[y * r_w + x]);
+
+            // acc - s_p * s_n * (1 / n)
+            /*__m256d num = _mm256_sub_pd(vacc, _mm256_mul_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip));*/
+            __m256d num = _mm256_fnmadd_pd(_mm256_mul_pd(vs_n, vs_p), vn_recip, vacc_d);
+            // (1 / norm_n) * (1 / norm_patch)
+            __m256d den = _mm256_mul_pd(vrnorm_n, vrn_p);
+            __m256d sim = _mm256_mul_pd(num, den);
+            int mask = _mm256_movemask_pd(
+                        _mm256_andnot_pd(
+                            _mm256_cmp_pd(sim, vinf, _CMP_EQ_OQ),
+                            _mm256_cmp_pd(sim, vthreshold, _CMP_GT_OQ)
+                        ));
+            if (mask == 0) continue; // fast path for no hits
+            for (size_t j = 0; j < 4; j++) {
+                if ((1 << j) & mask) {
+                    *out_cur++ = {(uint16_t)(x + j), (uint16_t)y, (float)sim[j]};
+                    if (out_cur == out_fin) {
+                        return n_out;
+                    }
+                }
             }
         }
+
         for (; x < end; x++) {
             uint32_t acc_ = _mm_extract_epi32(u32_8_sum(_mm256_load_si256((__m256i*)a)), 0);
             _mm256_store_si256((__m256i*)a, zero256);
