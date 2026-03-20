@@ -277,16 +277,9 @@ fn draw_test_text(
     font: &Font,
     text: &str,
     img: &DynamicImage,
-    decode_options: DecodeOptions,
+    _decode_options: DecodeOptions,
     render_options: RenderOptions,
 ) -> DynamicImage {
-    let DecodeOptions {
-        x_start,
-        y_start,
-        width,
-        line_height,
-        line_advance: _line_advance,
-    } = decode_options;
     let mut img_line = img
         .clone()
         //.crop_imm(x_start, y_start, width, line_height)
